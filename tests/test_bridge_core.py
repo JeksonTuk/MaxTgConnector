@@ -3740,7 +3740,7 @@ async def test_get_or_create_topic_resolves_group_title_via_live_max_lookup():
         chat_id="-70243447272944",
         chat_title=None,
         sender_id="10",
-        sender_name="Наталья Ростовцева",
+        sender_name="Тестовый Отправитель",
         text="Тест",
         attachments=[],
         attachment_types=[],
