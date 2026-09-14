@@ -37,6 +37,9 @@ jobs:
           TG_BOT_USERNAME: FamilyMaxBot
           MAX_PHONE: "+10000000000"
           OUTBOUND_ENABLED: "false"
+          # Корень проекта в путь импорта: в Docker-образе это делает
+          # ENV PYTHONPATH=/app, здесь такого слоя нет.
+          PYTHONPATH: ${{ github.workspace }}
         run: pytest -q
 
   deploy:
