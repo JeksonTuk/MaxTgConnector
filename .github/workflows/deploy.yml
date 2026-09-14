@@ -1,0 +1,117 @@
+name: Tests and deploy
+
+# Тесты — на каждый push и pull request. Деплой — только с main и только
+# после зелёных тестов (job needs), плюс ручной запуск из вкладки Actions.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # Два деплоя одновременно перезапускали бы один и тот же мост.
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tests:
+    name: Tests (python 3.13, no network)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run test suite
+        env:
+          TG_BOT_TOKEN: test-not-a-real-token
+          TG_OWNER_ID: "100000001"
+          TG_FORUM_GROUP_ID: "-100000001"
+          TG_ALLOWED_USER_IDS: "100000001,100000002"
+          TG_BOT_USERNAME: FamilyMaxBot
+          MAX_PHONE: "+10000000000"
+          OUTBOUND_ENABLED: "false"
+        run: pytest -q
+
+  deploy:
+    name: Deploy to RU VPS
+    needs: tests
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload sources
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          git archive --format=tar.gz -o /tmp/maxtg-deploy.tar.gz HEAD
+          scp -i ~/.ssh/deploy_key /tmp/maxtg-deploy.tar.gz \
+            "root@${SERVER_HOST}:/root/maxgram-bridge-deploy.tar.gz"
+
+      - name: Rebuild and restart bridge
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          ssh -i ~/.ssh/deploy_key "root@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+          set -e
+          DIR=/opt/maxgram-bridge
+          cd "$DIR"
+
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          mkdir -p "../maxgram-bridge-backup-$STAMP"
+          cp -a src deploy "../maxgram-bridge-backup-$STAMP/"
+
+          # Приватные файлы остаются на сервере: в архиве их нет, но явный
+          # exclude защищает от случайного коммита примера с реальными данными.
+          tar -xzf /root/maxgram-bridge-deploy.tar.gz -C "$DIR" \
+            --exclude='config.local.staging.yaml' --exclude='.env*'
+          chown 10001:10001 config.local.staging.yaml
+          chmod 400 config.local.staging.yaml
+          chmod 444 config.yaml
+
+          docker compose --env-file .env.staging -p maxgram-bridge-staging \
+            -f deploy/docker-compose.staging.yml \
+            -f deploy/docker-compose.staging.persist.yml \
+            up -d --build
+          REMOTE
+
+      - name: Verify bridge is healthy
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          sleep 30
+          ssh -i ~/.ssh/deploy_key "root@${SERVER_HOST}" 'bash -s' <<'REMOTE'
+          set -e
+          NAME=maxgram-bridge-staging-bridge-1
+
+          STATUS=$(docker inspect --format '{{.State.Status}}' "$NAME")
+          echo "container status: $STATUS"
+          [ "$STATUS" = "running" ] || { docker logs --tail 40 "$NAME"; exit 1; }
+
+          # Запрос SMS после деплоя означает потерянную сессию — это инцидент.
+          if docker logs --since 3m "$NAME" 2>&1 | grep -qiE 'auth_request|requesting sms|limit.violate'; then
+            echo "AUTH attempt detected after deploy"
+            docker logs --tail 40 "$NAME"
+            exit 1
+          fi
+
+          docker logs --since 3m "$NAME" 2>&1 | grep -E 'client started|adapter.connected' | tail -3
+          echo "deploy verified"
+          REMOTE
