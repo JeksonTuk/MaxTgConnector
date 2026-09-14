@@ -1,0 +1,323 @@
+"""
+MAX → Telegram Bridge — точка входа.
+
+Запуск:
+  python -m src.main
+  docker compose up
+"""
+
+import asyncio
+import contextlib
+import logging
+import os
+import signal
+import socket
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+# Добавляем корень проекта в path (для запуска из разных директорий)
+ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT))
+
+from src.config.loader import load_config
+from src.db.repository import Repository
+from src.bridge.contracts import MaxIssue
+from src.logging_utils import EventFormatter, log_event
+from src.runtime.health import RuntimeHealthStore
+from src.runtime.supervisor import BridgeSupervisor, SupervisorConfig
+from src.startup.composition import (
+    close_ops_notifier,
+    run_bridge_worker,
+    setup_ops_notifier,
+)
+
+
+@dataclass(frozen=True)
+class StartupTestReport:
+    status: str
+    summary: str
+
+
+def setup_logging():
+    """Логирование: только meta, без PII."""
+    level = os.environ.get("LOG_LEVEL", "INFO").upper()
+    fmt_mode = os.environ.get("LOG_FORMAT", "mixed").strip().lower() or "mixed"
+    formatter = EventFormatter(fmt_mode=fmt_mode)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(formatter)
+
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(level)
+    root.addHandler(handler)
+
+    if _env_flag("LOG_TO_FILE", default=True):
+        log_file_raw = os.environ.get("LOG_FILE", "").strip()
+        log_file = (
+            Path(log_file_raw)
+            if log_file_raw
+            else Path(os.environ.get("DATA_DIR", "./data")) / "bridge.log"
+        )
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(log_file, encoding="utf-8")
+            file_handler.setFormatter(formatter)
+            root.addHandler(file_handler)
+        except Exception as e:
+            print(f"Could not open bridge log file {log_file}: {e}", file=sys.stderr)
+
+    library_level = logging.DEBUG if _env_flag("LOG_LIBRARIES_DEBUG", default=False) else logging.WARNING
+    logging.getLogger("aiogram").setLevel(library_level)
+    logging.getLogger("pymax").setLevel(library_level)
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)
+
+
+def _mask_ip(ip: str | None) -> str | None:
+    if not ip:
+        return None
+    parts = ip.split(".")
+    if len(parts) == 4 and all(part.isdigit() for part in parts):
+        return f"{parts[0]}.{parts[1]}.*.{parts[3]}"
+    return ip
+
+
+def _detect_primary_ipv4() -> str | None:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("1.1.1.1", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
+
+
+def _infer_location(hostname: str) -> str | None:
+    explicit = os.environ.get("BRIDGE_LOCATION", "").strip()
+    if explicit:
+        return explicit
+
+    hostname_l = hostname.lower()
+    mapping = {
+        "hel1": "Helsinki",
+        "fsn1": "Falkenstein",
+        "nbg1": "Nuremberg",
+        "ash": "Ashburn",
+        "hil": "Hillsboro",
+        "sin": "Singapore",
+    }
+    for token, name in mapping.items():
+        if token in hostname_l:
+            return name
+    return None
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _install_signal_handlers(stop_event: asyncio.Event, logger: logging.Logger) -> None:
+    loop = asyncio.get_running_loop()
+
+    def _request_shutdown(sig_name: str) -> None:
+        if stop_event.is_set():
+            return
+        log_event(
+            logger,
+            logging.INFO,
+            "app.shutdown.requested",
+            stage="shutdown",
+            outcome="requested",
+            signal=sig_name,
+        )
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+            loop.add_signal_handler(sig, _request_shutdown, sig.name)
+
+
+def _extract_pytest_summary(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return "pytest finished without output"
+
+    for line in reversed(lines):
+        if " in " not in line:
+            continue
+        if any(token in line for token in ("passed", "failed", "error", "errors", "skipped", "xfailed", "xpassed")):
+            return line
+
+    return lines[-1]
+
+
+def _format_startup_tests_line(report: StartupTestReport) -> str:
+    if report.status == "passed":
+        return f"Тесты запуска: ✅ {report.summary}"
+    if report.status == "failed":
+        return f"Тесты запуска: ❌ {report.summary}"
+    if report.status == "timeout":
+        return f"Тесты запуска: ⏱️ {report.summary}"
+    if report.status == "skipped":
+        return f"Тесты запуска: ⚪ {report.summary}"
+    return f"Тесты запуска: ⚠️ {report.summary}"
+
+
+async def run_startup_tests(logger: logging.Logger) -> StartupTestReport:
+    if not _env_flag("STARTUP_TESTS_ENABLED", default=False):
+        return StartupTestReport(status="skipped", summary="отключены")
+
+    try:
+        timeout = max(1, int(os.environ.get("STARTUP_TESTS_TIMEOUT_SECONDS", "120")))
+    except ValueError:
+        timeout = 120
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "pytest",
+        "-q",
+        "--maxfail=1",
+        "-p",
+        "no:cacheprovider",
+    ]
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    logger.info("Running startup tests: %s", " ".join(cmd))
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=str(ROOT),
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+    except Exception as e:
+        logger.error("Could not launch startup tests: %s", e, exc_info=True)
+        return StartupTestReport(status="error", summary=f"не удалось запустить pytest: {e}")
+
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.communicate()
+        logger.error("Startup tests timed out after %ss", timeout)
+        return StartupTestReport(status="timeout", summary=f"таймаут после {timeout}с")
+
+    output = stdout.decode("utf-8", errors="replace")
+    summary = _extract_pytest_summary(output)
+
+    if proc.returncode == 0:
+        logger.info("Startup tests passed: %s", summary)
+        return StartupTestReport(status="passed", summary=summary)
+
+    logger.error("Startup tests failed: %s\n%s", summary, output)
+    return StartupTestReport(status="failed", summary=summary)
+
+
+async def build_startup_notification(repo: Repository,
+                                     startup_tests: StartupTestReport | None = None) -> str:
+    hostname = socket.gethostname()
+    location = _infer_location(hostname)
+    masked_ip = _mask_ip(_detect_primary_ipv4())
+    runtime = "Docker" if Path("/.dockerenv").exists() else "Local"
+
+    try:
+        bindings = await repo.list_bindings()
+        total_chats = len(bindings)
+        active_chats = sum(1 for b in bindings if b.mode == "active")
+        chats_info = f"Чатов: {total_chats} (активных: {active_chats})"
+    except Exception:
+        chats_info = ""
+
+    lines = ["🚀 Maxgram запущен и подключён к MAX"]
+    infra = [f"runtime: {runtime}", f"host: {hostname}"]
+    if location:
+        infra.append(f"location: {location}")
+    if masked_ip:
+        infra.append(f"ip: {masked_ip}")
+    lines.append(" · ".join(infra))
+    if chats_info:
+        lines.append(chats_info)
+    if startup_tests is not None:
+        lines.append(_format_startup_tests_line(startup_tests))
+    lines.append("Команды: /status · /chats · /watchdog · /dm · /help")
+    return "\n".join(lines)
+
+
+def build_max_issue_notification(issue: MaxIssue) -> str:
+    lines = [f"❌ MAX недоступен: {issue.summary}"]
+    if issue.requires_reauth:
+        lines.append("Нужен reauth: перезапусти bridge и введи новый SMS-код.")
+    if issue.raw_error:
+        lines.append(f"Причина: {issue.raw_error}")
+    lines.append("Проверь /status после восстановления.")
+    return "\n".join(lines)
+
+
+async def main():
+    setup_logging()
+    logger = logging.getLogger("bridge.main")
+    stop_event = asyncio.Event()
+    _install_signal_handlers(stop_event, logger)
+
+    config_path = os.environ.get("CONFIG_PATH", "config.yaml")
+    log_event(
+        logger,
+        logging.INFO,
+        "app.startup.config_loading",
+        stage="startup",
+        outcome="started",
+        config_path=Path(config_path).name,
+    )
+
+    try:
+        cfg = load_config(config_path)
+    except Exception as e:
+        logger.critical("Config error: %s", e)
+        sys.exit(1)
+
+    health_store = RuntimeHealthStore(
+        cfg.storage.data_dir,
+        reminder_interval_hours=cfg.health.reminder_interval_hours,
+        heartbeat_interval_seconds=cfg.health.heartbeat_interval_seconds,
+    )
+
+    ops_runtime = await setup_ops_notifier(cfg, health_store, logger)
+
+    supervisor = BridgeSupervisor(
+        health_store=health_store,
+        worker_factory=lambda: run_bridge_worker(
+            cfg,
+            health_store,
+            ops_runtime.notifier,
+            logger,
+            startup_tests_runner=run_startup_tests,
+            startup_notification_builder=build_startup_notification,
+        ),
+        notify=(
+            ops_runtime.notifier.send_system_notification
+            if ops_runtime.notifier is not None
+            else None
+        ),
+        config=SupervisorConfig(
+            heartbeat_interval_seconds=cfg.health.heartbeat_interval_seconds,
+            worker_restart_backoff_seconds=cfg.health.worker_restart_backoff_seconds,
+        ),
+    )
+
+    try:
+        await supervisor.run(stop_event=stop_event)
+    finally:
+        await close_ops_notifier(ops_runtime)
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nBridge stopped.")

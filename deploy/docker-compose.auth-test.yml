@@ -1,0 +1,33 @@
+services:
+  max-sms-auth-test:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.auth-test
+    environment:
+      PYTHONUNBUFFERED: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: /app
+      AUTH_TEST_DATA_DIR: /app/auth-data
+      AUTH_TEST_EGRESS_TYPE: ${AUTH_TEST_EGRESS_TYPE:?Set direct or http_connect}
+      MAX_EGRESS_PROXY_URL: ${MAX_EGRESS_PROXY_URL-}
+      MAX_PHONE: ${MAX_PHONE:?Set MAX_PHONE in the private auth-test env file}
+      OUTBOUND_ENABLED: "false"
+    volumes:
+      - max_sms_auth_test_session:/app/auth-data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "10001:10001"
+    mem_limit: 512m
+    cpus: "0.50"
+    pids_limit: 128
+    restart: "no"
+    stdin_open: true
+    tty: true
+
+volumes:
+  max_sms_auth_test_session:

@@ -1,0 +1,37 @@
+services:
+  bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    env_file:
+      - ../.env.staging
+      - ../.env.staging.secrets
+    environment:
+      CONFIG_PATH: /app/config.yaml
+      CONFIG_LOCAL_PATH: /app/config.local.yaml
+      DATA_DIR: /app/data
+      TMPDIR: /tmp/bridge-tmp
+      PYTHONUNBUFFERED: "1"
+      # Первая проверка только наблюдает и принимает входящие события.
+      OUTBOUND_ENABLED: "false"
+    user: "10001:10001"
+    restart: "no"
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    mem_limit: 512m
+    cpus: 0.75
+    volumes:
+      - ../data.staging:/app/data
+      - ../config.yaml:/app/config.yaml:ro
+      - ../config.local.staging.yaml:/app/config.local.yaml:ro
+
+networks:
+  default:
+    name: maxgram-family-staging-network

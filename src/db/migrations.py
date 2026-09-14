@@ -1,0 +1,215 @@
+"""SQLite schema migration runner."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass
+
+import aiosqlite
+
+from .models import SCHEMA
+
+
+@dataclass(frozen=True)
+class Migration:
+    version: int
+    name: str
+    sql: str
+
+
+MIGRATIONS = [
+    Migration(1, "baseline_schema", SCHEMA),
+    Migration(
+        2,
+        "pending_outbound_messages",
+        """
+        CREATE TABLE IF NOT EXISTS pending_outbound_messages (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_topic_id          INTEGER NOT NULL,
+            tg_msg_id            INTEGER NOT NULL,
+            max_chat_id          TEXT NOT NULL,
+            reply_to_max_id      TEXT,
+            text                 TEXT,
+            status               TEXT NOT NULL DEFAULT 'pending',
+            attempts             INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at      INTEGER NOT NULL,
+            last_error           TEXT,
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            last_attempt_at      INTEGER,
+            lease_until          INTEGER,
+            delivered_max_msg_id TEXT,
+            delivered_at         INTEGER,
+            UNIQUE(tg_topic_id, tg_msg_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_outbound_status_due
+          ON pending_outbound_messages(status, next_attempt_at, lease_until);
+        CREATE INDEX IF NOT EXISTS idx_pending_outbound_created
+          ON pending_outbound_messages(created_at);
+        """,
+    ),
+    Migration(
+        3,
+        "pending_inbound_messages",
+        """
+        CREATE TABLE IF NOT EXISTS pending_inbound_messages (
+            id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+            max_chat_id          TEXT NOT NULL,
+            max_msg_id           TEXT NOT NULL,
+            tg_topic_id          INTEGER NOT NULL,
+            text                 TEXT,
+            status               TEXT NOT NULL DEFAULT 'pending',
+            attempts             INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at      INTEGER NOT NULL,
+            last_error           TEXT,
+            created_at           INTEGER NOT NULL,
+            updated_at           INTEGER NOT NULL,
+            last_attempt_at      INTEGER,
+            lease_until          INTEGER,
+            delivered_tg_msg_id  INTEGER,
+            delivered_at         INTEGER,
+            UNIQUE(max_chat_id, max_msg_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pending_inbound_status_due
+          ON pending_inbound_messages(status, next_attempt_at, lease_until);
+        CREATE INDEX IF NOT EXISTS idx_pending_inbound_created
+          ON pending_inbound_messages(created_at);
+        """,
+    ),
+    Migration(
+        4,
+        "telegram_callback_actions",
+        """
+        CREATE TABLE IF NOT EXISTS telegram_callback_actions (
+            id              TEXT PRIMARY KEY,
+            action_type     TEXT NOT NULL,
+            max_chat_id     TEXT NOT NULL,
+            max_msg_id      TEXT NOT NULL,
+            tg_topic_id     INTEGER,
+            tg_msg_id       INTEGER,
+            source_type     TEXT,
+            payload_json    TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            created_at      INTEGER NOT NULL,
+            used_at         INTEGER,
+            last_error      TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tg_callback_actions_status
+          ON telegram_callback_actions(status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_tg_callback_actions_source
+          ON telegram_callback_actions(max_chat_id, max_msg_id);
+        """,
+    ),
+    Migration(
+        5,
+        "delivered_media_parts",
+        """
+        CREATE TABLE IF NOT EXISTS delivered_media_parts (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            max_chat_id      TEXT NOT NULL,
+            base_max_msg_id  TEXT NOT NULL,
+            attachment_index INTEGER NOT NULL,
+            kind             TEXT NOT NULL,
+            tg_msg_id        INTEGER NOT NULL,
+            tg_topic_id      INTEGER,
+            source           TEXT NOT NULL,
+            media_chat_id    TEXT,
+            media_msg_id     TEXT,
+            reference_kind   TEXT,
+            reference_id     TEXT,
+            created_at       INTEGER NOT NULL,
+            updated_at       INTEGER NOT NULL,
+            UNIQUE(max_chat_id, base_max_msg_id, attachment_index, kind)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_delivered_media_base
+          ON delivered_media_parts(max_chat_id, base_max_msg_id);
+        CREATE INDEX IF NOT EXISTS idx_delivered_media_reference
+          ON delivered_media_parts(max_chat_id, base_max_msg_id, kind, reference_kind, reference_id);
+        """,
+    ),
+    Migration(
+        6,
+        "media_recovery_cache",
+        """
+        CREATE TABLE IF NOT EXISTS media_recovery_cache (
+            id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+            max_chat_id        TEXT NOT NULL,
+            max_msg_id         TEXT NOT NULL,
+            attachment_index   INTEGER NOT NULL,
+            kind               TEXT NOT NULL,
+            source_type        TEXT,
+            media_chat_id      TEXT,
+            media_msg_id       TEXT,
+            reference_kind     TEXT,
+            reference_id       TEXT,
+            filename           TEXT,
+            duration           INTEGER,
+            width              INTEGER,
+            height             INTEGER,
+            payload_cipher     TEXT,
+            payload_ciphertext TEXT,
+            created_at         INTEGER NOT NULL,
+            updated_at         INTEGER NOT NULL,
+            expires_at         INTEGER NOT NULL,
+            UNIQUE(max_chat_id, max_msg_id, attachment_index, kind)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_media_recovery_cache_expires
+          ON media_recovery_cache(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_media_recovery_cache_source
+          ON media_recovery_cache(media_chat_id, media_msg_id, reference_kind, reference_id);
+        """,
+    ),
+    Migration(
+        7,
+        "outbound_reaction_updates",
+        """
+        CREATE TABLE IF NOT EXISTS pending_outbound_reactions (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            tg_topic_id     INTEGER NOT NULL,
+            tg_msg_id       INTEGER NOT NULL,
+            reaction        TEXT NOT NULL,
+            status          TEXT NOT NULL DEFAULT 'pending',
+            attempts        INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at INTEGER NOT NULL,
+            last_error      TEXT,
+            created_at      INTEGER NOT NULL,
+            updated_at      INTEGER NOT NULL,
+            UNIQUE(tg_topic_id, tg_msg_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_pending_outbound_reactions_status_due
+          ON pending_outbound_reactions(status, next_attempt_at);
+        """,
+    ),
+]
+
+
+async def apply_migrations(db: aiosqlite.Connection) -> None:
+    await db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+            version    INTEGER PRIMARY KEY,
+            name       TEXT NOT NULL,
+            applied_at INTEGER NOT NULL
+        )
+        """
+    )
+    async with db.execute("SELECT version FROM schema_migrations") as cur:
+        applied = {int(row[0]) for row in await cur.fetchall()}
+
+    for migration in MIGRATIONS:
+        if migration.version in applied:
+            continue
+        await db.executescript(migration.sql)
+        await db.execute(
+            """
+            INSERT INTO schema_migrations(version, name, applied_at)
+            VALUES (?, ?, ?)
+            """,
+            (migration.version, migration.name, int(time.time())),
+        )
+    await db.commit()

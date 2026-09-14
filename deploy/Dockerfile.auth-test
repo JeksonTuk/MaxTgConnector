@@ -1,0 +1,28 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN groupadd --system --gid 10001 auth_tester && \
+    useradd --system --uid 10001 --gid auth_tester --create-home \
+    --home-dir /home/auth_tester auth_tester
+
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# В образ попадают только зависимости и код тестового запуска; Telegram не запускается.
+COPY src/ ./src/
+COPY scripts/max_sms_auth_test.py ./scripts/max_sms_auth_test.py
+
+RUN mkdir -p /app/auth-data /tmp/auth-test-tmp && \
+    chown -R auth_tester:auth_tester /app /tmp/auth-test-tmp
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    AUTH_TEST_DATA_DIR=/app/auth-data \
+    TMPDIR=/tmp/auth-test-tmp \
+    OUTBOUND_ENABLED=false
+
+USER auth_tester
+
+CMD ["python", "scripts/max_sms_auth_test.py", "--mode", "first"]

@@ -1,0 +1,60 @@
+# Локальный override-конфиг. Не коммить в git.
+# Скопируй в config.local.yaml и заполни своими chat_id / title / mode.
+
+telegram:
+  # Разрешённые numeric Telegram user_id: TG_ALLOWED_USER_IDS=id1,id2.
+  allowed_user_ids: "<TG_USER_ID_1>,<TG_USER_ID_2>"
+  # Username bridge-бота без символа @.
+  bot_username: "<BRIDGE_BOT_USERNAME>"
+  # Основной служебный канал по умолчанию — owner DM (TG_OWNER_ID).
+  # ops_topic_id нужен только если хочешь дублировать алерты/статусы
+  # ещё и в отдельный forum topic внутри forum_group_id.
+  ops_topic_id: 1234
+
+health:
+  reminder_interval_hours: 4
+  heartbeat_interval_seconds: 30
+  worker_restart_backoff_seconds: 5
+  max_egress_probe_interval_seconds: 30
+  max_self_heal_grace_seconds: 180
+  max_self_heal_restart_cooldown_seconds: 1800
+  dm_history_sweep:
+    enabled: true
+    warmup_seconds: 600
+    warmup_interval_seconds: 120
+    steady_interval_seconds: 900
+    limit: 30
+    backfill_seconds: 172800
+    cycle_jitter_seconds: 30
+    per_chat_delay_seconds: 0.5
+
+# Включается на production: внешний watchdog на втором VPS опрашивает этот API
+# через SSH-канал. Токен берётся из BRIDGE_STATUS_TOKEN в .env.secrets.
+status_api:
+  enabled: true
+  # В контейнере слушаем 0.0.0.0; наружу порт публикуется только на
+  # 127.0.0.1 хоста (deploy/docker-compose.prod.yml).
+  host: "0.0.0.0"
+  port: 18140
+
+max:
+  # Основной production-режим: MAX API/CDN идёт через reverse Channel M.
+  # Роутер держит outbound SSH remote-forward на VPS, а bridge использует
+  # authenticated HTTP CONNECT к VPS-local listener. Telegram остаётся direct
+  # с VPS/host-а bridge.
+  egress:
+    active: "home_ru_proxy"
+    fallback_policy: "manual"
+    profiles:
+      home_ru_proxy:
+        type: "http_connect"
+        proxy_url: "${MAX_EGRESS_PROXY_URL}"
+      hetzner_direct:
+        type: "direct"
+
+chats:
+  - max_chat_id: "<ALLOWED_MAX_CHAT_ID>"
+    title: "<ALLOWED_CHAT_TITLE>"
+    mode: "active"
+
+  # Добавь дополнительные разрешённые MAX-чаты отдельными записями.

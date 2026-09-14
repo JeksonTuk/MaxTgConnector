@@ -1,0 +1,32 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+RUN groupadd --system --gid 10001 tester && \
+    useradd --system --uid 10001 --gid tester --create-home --home-dir /home/tester tester
+
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# В тестовый образ попадает только код, тесты и документация, но не data/, .env
+# и не MAX-сессия.
+COPY src/ ./src/
+COPY tests/ ./tests/
+COPY docs/ ./docs/
+COPY deploy/ ./deploy/
+COPY infra/ ./infra/
+COPY scripts/ ./scripts/
+COPY pytest.ini pyproject.toml config.yaml ./
+
+RUN mkdir -p /tmp/test-data /tmp/test-tmp && \
+    chown -R tester:tester /app /tmp/test-data /tmp/test-tmp
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    DATA_DIR=/tmp/test-data \
+    TMPDIR=/tmp/test-tmp
+
+USER tester
+
+CMD ["pytest", "-q"]

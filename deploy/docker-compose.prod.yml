@@ -1,0 +1,44 @@
+services:
+  bridge:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: maxtg-bridge:prod
+    env_file:
+      - ../.env
+      - ../.env.secrets
+    environment:
+      CONFIG_PATH: /app/config.yaml
+      CONFIG_LOCAL_PATH: /app/config.local.yaml
+      DATA_DIR: /app/data
+      PYTHONUNBUFFERED: "1"
+      STARTUP_TESTS_ENABLED: "1"
+      STARTUP_TESTS_TIMEOUT_SECONDS: "120"
+    extra_hosts:
+      # MAX_EGRESS_PROXY_HOST and MAX_EGRESS_PROXY_GATEWAY are set in
+      # deploy/.env by 23-channel-m-reverse.yml. Defaults are no-ops when
+      # Channel M is not deployed. host-gateway is wrong here because the
+      # tunnel binds on the deploy_default network gateway, not docker0.
+      - "${MAX_EGRESS_PROXY_HOST:-channel-m.invalid}:${MAX_EGRESS_PROXY_GATEWAY:-host-gateway}"
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    restart: always
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 256
+    mem_limit: 512m
+    volumes:
+      - ../data:/app/data
+      - ../config.yaml:/app/config.yaml:ro
+      - ../config.local.yaml:/app/config.local.yaml:ro
+    ports:
+      # Read-only status API для внешнего watchdog. Слева 127.0.0.1 — это и есть
+      # ограничение доступа: порт виден только с самого хоста, наружу уходит
+      # через SSH-канал (docs/runbooks/watchdog.md). Внутри контейнера сервер
+      # обязан слушать 0.0.0.0, иначе publish до него не достучится.
+      - "127.0.0.1:18140:18140"

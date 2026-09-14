@@ -1,0 +1,70 @@
+# Secrets
+.env
+.env.*
+.env.host
+config.local.yaml
+config.local.staging.yaml
+HANDOFF.local.md
+.claude/settings.local.json
+
+# Local deployment notes (server IPs, credentials)
+deploy/server.local.md
+# External watchdog: приватный ключ наблюдателя и его локальные deploy-настройки
+deploy/external-watchdog/secrets/
+deploy/external-watchdog/.deploy.env
+# Полный снимок конфигурации с реальными адресами — только локально
+deploy/external-watchdog/CONFIGURATION.local.md
+
+# Ansible — реальный inventory с IP сервера, lab inventory, локальные бэкапы
+infra/ansible/inventory/production.ini
+infra/ansible/inventory/lab.ini
+infra/ansible/.vault_pass
+backups/
+
+# MAX session (all variants)
+data/.max_session
+data/max_bridge_session
+data/session.db
+*.max_session
+
+# Database & temp files
+data/bridge.db
+data/bridge.db-shm
+data/bridge.db-wal
+data/tmp/
+data.staging/
+*.db
+*.db-shm
+*.db-wal
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs (содержат meta, но всё равно не в git)
+logs/
+*.log

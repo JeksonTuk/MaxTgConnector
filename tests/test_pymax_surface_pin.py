@@ -1,0 +1,113 @@
+"""Pin the PyMax 2 surface the bridge backend depends on."""
+
+import importlib
+
+import pytest
+import pymax
+
+
+pytestmark = pytest.mark.architecture
+
+
+def test_pymax_runtime_version_is_pinned():
+    assert pymax.__version__ == "2.4.1"
+
+
+PINS = {
+    "pymax": (
+        "Client",
+        "ExtraConfig",
+        "SyncOverrides",
+        "File",
+        "Message",
+        "Photo",
+        "Video",
+        "TypingEvent",
+        "PresenceEvent",
+        "MessageReadEvent",
+        "ReactionUpdateEvent",
+        "MessageDeleteEvent",
+        "VideoNote",
+        "Voice",
+        "PasswordAttemptsExceededError",
+    ),
+    "pymax.types": ("ContactInfo",),
+    "pymax.types.domain.attachments": (
+        "Poll",
+        "PollAttachment",
+        "ShareAttachment",
+        "VideoRequest",
+    ),
+    "pymax.client": ("Client",),
+    "pymax.connection": ("ConnectionManager",),
+    "pymax.connection.readers": ("TCPReader",),
+    "pymax.protocol": ("Command", "Opcode"),
+    "pymax.protocol.tcp": ("TcpProtocol",),
+    "pymax.protocol.tcp.compression": ("Lz4BlockCompression", "ZstdCompression"),
+    "pymax.protocol.tcp.framing": ("TcpPacketFramer",),
+    "pymax.protocol.tcp.payload": ("MsgpackPayloadCodec", "TcpPayloadDecoder"),
+    "pymax.transport.tcp": ("TCPTransport",),
+    "pymax.session": ("InMemoryStore", "SessionStore"),
+    "pymax.session.models": ("SessionInfo",),
+    "pymax.api.auth.payloads": ("SyncPayload", "WebSyncPayload"),
+    "pymax.api.auth.service": ("AuthService",),
+    "pymax.api.session.enums": ("DeviceType",),
+    "pymax.api.session.payloads": ("MobileUserAgentPayload",),
+    "pymax.api.messages.payloads": (
+        "ChatHistoryPayload",
+        "ForwardMessagePayload",
+        "GetVideoPayload",
+    ),
+    "pymax.auth": ("AuthFlow", "SmsAuthFlow", "ConsoleSmsCodeProvider"),
+    "pymax.types.domain.attachments.enums": ("AttachmentType",),
+    "pymax.types.domain.login": ("LoginResponse",),
+    "pymax.versions.catalog": ("VersionCatalog",),
+}
+
+
+@pytest.mark.parametrize(("module_name", "names"), PINS.items())
+def test_pymax_backend_surface_is_pinned(module_name: str, names: tuple[str, ...]):
+    module = importlib.import_module(module_name)
+    missing = [name for name in names if not hasattr(module, name)]
+
+    assert not missing, (
+        f"{module_name} no longer exports {missing}. "
+        "This is an upstream PyMax surface change; adjust the MAX backend before deploy."
+    )
+
+
+def test_pymax_241_client_methods_are_pinned():
+    for name in (
+        "forward_message",
+        "import_contacts",
+        "on_disconnect",
+        "on_error",
+        "relogin",
+        "delete_chat",
+        "join_group",
+        "join_channel",
+        "vote_poll",
+        "get_chat_members",
+        "add_admin",
+        "set_presence",
+        "is_update_available",
+        "change_profile_settings",
+        "connect",
+        "get_video_by_id",
+    ):
+        assert hasattr(pymax.Client, name), f"pymax.Client.{name} is missing"
+
+
+def test_pymax_240_message_forward_bound_method_is_pinned():
+    assert hasattr(pymax.Message, "forward")
+
+
+def test_pymax_240_session_store_delete_all_sessions_is_pinned():
+    from pymax.session import SessionStore
+
+    assert hasattr(SessionStore, "delete_all_sessions")
+
+
+def test_pymax_241_lazy_runtime_hooks_are_pinned():
+    for name in ("_ensure_runtime", "_build_app", "is_connected"):
+        assert hasattr(pymax.Client, name), f"pymax.Client.{name} is missing"

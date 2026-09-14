@@ -1,0 +1,1025 @@
+# Runbook: Операционные процедуры
+
+## Запуск через Ansible
+
+Альтернатива ручному SSH-workflow ниже. Все playbook'и — в [infra/ansible/](../../infra/ansible/), детали в [infra/ansible/README.md](../../infra/ansible/README.md).
+
+```bash
+cd infra/ansible
+
+# Регулярный deploy:
+# --check --diff = безопасный preflight verify текущего состояния, без rollout
+ansible-playbook deploy.yml --check --diff
+ansible-playbook deploy.yml                   # затем реально
+
+# Бэкап на локальную машину перед рискованным изменением
+ansible-playbook backup.yml
+
+# Восстановление на свежем VM (после bootstrap.yml)
+ansible-playbook recover.yml -e backup_archive=../../backups/maxtg-backup-prod-<TS>.tgz
+```
+
+`bootstrap.yml` и `hardening.yml` — только для нового VM, текущий prod уже подготовлен руками.
+
+Ручной workflow ниже остаётся источником правды для шагов, которые Ansible намеренно не автоматизирует (создание VM в Hetzner панели, копирование секретов, SMS reauth).
+
+Важно:
+
+- `deploy.yml --check --diff` не симулирует `docker compose build/up`.
+- В check mode playbook делает только preflight: preconditions, healthcheck, logs, smoke-check.
+- Реальный rollout выполняется только обычным `ansible-playbook deploy.yml`.
+
+## Production: Hetzner quick checklist
+
+Текущий production-сценарий:
+
+- сервер на Hetzner Cloud
+- bridge работает в Docker Compose
+- SSH доступ только по ключу
+- SSH разрешён только с твоего текущего домашнего IP
+- на VM включены `UFW`, `fail2ban`, `unattended-upgrades`
+
+### Как заходить на сервер
+
+```bash
+ssh -i ~/.ssh/id_rsa deploy@<SERVER_IP>
+```
+
+После входа:
+
+```bash
+cd /opt/maxtg-bridge
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml ps
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=50
+```
+
+### Как обновлять bridge
+
+```bash
+ssh -i ~/.ssh/id_rsa deploy@<SERVER_IP>
+cd /opt/maxtg-bridge
+git pull
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml build
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml up -d
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=80
+```
+
+### Как сделать MAX reauth после сброса session token
+
+Если в `/status` или логах видно `FAIL_LOGIN_TOKEN` / `requires_reauth=true`,
+текущий MAX token больше не принимается. Такое может случиться после включения
+дополнительного пароля/SMS в MAX.
+
+Не делать профилактический reauth "на всякий случай": обычный reboot/offline
+должен восстанавливаться через существующую device session, как обычный
+клиент мессенджера. Reauth запускается только при явном invalid token /
+`requires_reauth=true` или при осознанной ручной проверке. Скрипт откажется
+очищать saved session без `--confirm-clear-session` и не должен запускаться,
+пока bridge heartbeat свежий.
+
+```bash
+ssh -i ~/.ssh/id_rsa deploy@<SERVER_IP>
+cd /opt/maxtg-bridge
+
+# Не держим два MAX-клиента одновременно.
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml stop bridge
+
+# Ввести SMS-код и, если MAX попросит, 2FA-пароль. Скрипт не сохраняет пароль.
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml run --rm -it bridge \
+  python scripts/max_reauth.py --confirm-clear-session
+
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml up -d bridge
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=80 --since=5m bridge
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+Reauth deliberately disables legacy PyMax 1 `auth` import, иначе старый
+invalid token может быть импортирован обратно вместо SMS-flow.
+
+Если MAX вернул валидный mobile handshake без `calls_seed`, bridge не меняет
+device profile и не включает автоматический relogin: только для этого ручного
+SMS-запроса он опускает optional desktop fingerprint. Это совместимый fallback
+для продолжения штатного reauth; при наличии `calls_seed` остаётся обычный
+fingerprint path PyMax.
+
+Ошибка `client.unsupported-version` до SMS означает, что production image
+устарел: пересобери образ из уже отправленного commit, где DESKTOP profile
+берёт совместимые `app_version` и `build_number` из bundled PyMax
+`VersionCatalog`. Не повторяй SMS-flow на старом образе.
+
+Перед изменением session DB скрипт сохраняет `data/session.db.before-reauth-*`
+с правами `0600`. Это файл с token, его не копировать в логи/чат и не
+публиковать.
+
+Не закрывать старые MAX sessions через bridge/PyMax `SESSIONS_CLOSE`: live-run
+показал, что этот opcode может завершить все desktop sessions (`FAIL_LOGOUT_ALL`),
+а не одну выбранную запись. Лишние sessions закрывать вручную в телефоне.
+
+Ожидаемо: после reauth в логах появляется `MAX connected`, `requires_reauth`
+исчезает, а `/status` снова показывает рабочий MAX link и `MAX egress:
+home_ru_proxy`.
+
+### Как восстановиться, если домашний IP сменился
+
+Сейчас SSH разрешён только с твоего текущего IP.
+
+Нужно обновить доступ в двух местах:
+
+1. В панели Hetzner Cloud Firewall:
+   - не должно быть широких правил `Any IPv4` / `Any IPv6`
+   - должно быть только `22/tcp` с нового IP в формате `x.x.x.x/32`
+2. На самом сервере в `UFW`:
+
+```bash
+# зайти через Hetzner Console / LISH или временно открыть доступ в Cloud Firewall
+sudo ufw delete allow from <OLD_IP> to any port 22 proto tcp
+sudo ufw allow from <NEW_IP> to any port 22 proto tcp comment 'SSH from home IP'
+sudo ufw status numbered
+```
+
+### Как проверить, что bridge жив
+
+```bash
+ssh -i ~/.ssh/id_rsa deploy@<SERVER_IP>
+cd /opt/maxtg-bridge
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml ps
+docker inspect --format '{{json .State.Health}}' deploy-bridge-1 | jq
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=100 --since=10m
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+Ожидаемое состояние:
+
+- контейнер `bridge` в статусе `Up`
+- Docker healthcheck в статусе `healthy`
+- в логах есть `MAX connected`
+- `/status` показывает `MAX egress: home_ru_proxy` в production
+- `/status` показывает последнюю `MAX egress probe` без credentials; успешный
+  probe должен доходить до `target_tls`
+- в свежем startup-логе есть `Running startup tests` и затем `Startup tests passed: ...`
+- нет непрерывных ошибок `TelegramConflictError`
+- в `message_map` и `delivery_log` появляются свежие записи
+- видео из MAX уходит как `send_video`; signed CDN URL должен открываться с `User-Agent`, соответствующим `srcAg` (`CHROME`, `CHROME_ANDROID`, `CHROME_IPHONE`, Safari/iPhone fallback)
+- если видео/медиа не скачалось полностью, bridge делает до 7 попыток и пробует докачку через `Range`; после окончательного провала в Telegram должен прийти текст `⚠️ Не удалось скачать вложение MAX...`, а в `delivery_log.status` будет `partial`
+
+### Machine-readable diagnostics
+
+Для диагностики автоматикой включай structured JSON logs:
+
+```bash
+LOG_FORMAT=json
+```
+
+`LOG_FORMAT=mixed` удобнее глазами, но `json` стабильнее для `jq`, log shipping и
+поиска по `event`, `flow_id`, `direction`, `stage`, `outcome`, `reason`.
+Инвариант приватности тот же: не логировать текст сообщений, media, invite links,
+телефоны, токены или raw MAX payloads.
+
+Второй машиночитаемый источник — status API самого bridge (`status_api` в
+конфиге). Он слушает только loopback и нужен внешнему watchdog, но им же удобно
+пользоваться руками на сервере:
+
+```bash
+curl -s localhost:18140/healthz                                            # 200 / 503
+curl -s -H "Authorization: Bearer $BRIDGE_STATUS_TOKEN" localhost:18140/status | jq .
+```
+
+`/status` отдаёт `overall_status`, подсистемы с кодами issue, глубину очередей,
+`alert_outbox_size` и активный egress. Тексты сообщений, названия чатов и
+`raw_cause` исключений туда не попадают. Без `BRIDGE_STATUS_TOKEN` сервер не
+поднимается вовсе.
+
+### MAX service events и реакции
+
+MAX `CONTROL` события (`add`, `remove`, `leave`, `joinbylink`) отображаются в
+Telegram человекочитаемым сервисным текстом. Bridge best-effort подставляет имя
+участника из target/member/user полей или из кеша пользователей; если MAX/pymax
+не отдаёт target, остаётся generic текст вроде `Участник удалён из чата`.
+Ошибки такого enrichment не должны блокировать доставку обычного текста/медиа:
+в лог пишется безопасный metadata-only warning без raw payload/message text, а
+в Telegram уходит generic service text.
+
+Reaction updates не создают отдельное сообщение: bridge редактирует footer
+уже доставленного Telegram-сообщения. Если MAX отдаёт автора реакции, footer
+получает строку `Последняя реакция: <имя> — <emoji>`; иначе остаются только
+агрегированные счётчики.
+
+MAX `SHARE`, `inline_keyboard` и похожие non-media payloads могут давать
+Telegram inline buttons:
+
+- `https://max.ru/join/...` становится callback-кнопкой `Вступить в MAX`;
+- callback owner-only: если кнопку нажимает не владелец bridge, MAX join не
+  вызывается;
+- владелец нажимает кнопку в Telegram, bridge вызывает PyMax
+  `join_group(link)` с fallback на `join_channel(link)` и затем ставит
+  recovery scan, чтобы новый чат/топик обнаружился штатным registry flow;
+- внешние `http(s)` ссылки становятся обычными Telegram URL-кнопками
+  `Открыть сайт`/по label из payload.
+
+Privacy boundary: SQLite `telegram_callback_actions` хранит только payload для
+MAX invite callback (`max.ru/join/...`). Обычные внешние ссылки не пишутся в
+SQLite, `/status`, `/recovery report`, `/recovery export`, health files или
+normal logs. Raw `SHARE`/keyboard payloads не логируются.
+
+Prometheus textfile metrics пишутся атомарно в `data/maxtg_bridge.prom` по
+умолчанию. Если позже появится node_exporter textfile collector, укажи абсолютный
+путь через config/env:
+
+```yaml
+health:
+  metrics_textfile_path: "/var/lib/node_exporter/textfile_collector/maxtg_bridge.prom"
+  metrics_interval_seconds: 30
+```
+
+или:
+
+```bash
+METRICS_TEXTFILE_PATH=/var/lib/node_exporter/textfile_collector/maxtg_bridge.prom
+```
+
+Значение `off`/`disabled` отключает writer. Сейчас в Ansible нет отдельной роли
+`monitoring`/`node_exporter`, поэтому production path должен быть явным, если
+инфраструктура добавит collector.
+
+Куда идут служебные сообщения:
+
+- основной канал: личный чат владельца с ботом (`TG_OWNER_ID`)
+- дополнительный канал: forum topic внутри `TG_FORUM_GROUP_ID`, только если задан `telegram.ops_topic_id`
+- если `ops_topic_id` не задан, все startup/status/error alert сообщения идут только в owner DM
+
+### Что важно помнить
+
+- Доступ к серверу теперь только с твоего текущего IP.
+- Если домашний IP изменится, нужно будет обновить правило и в Hetzner Firewall, и в `UFW`.
+- Cloud Firewall я не менял через API, потому что для этого нужен отдельный Hetzner API token.
+- Поэтому в панели Hetzner отдельно проверь, что там нет широких правил `Any IPv4` / `Any IPv6`, а только `22/tcp` с твоего IP.
+- В production у контейнера `restart: always`, поэтому после аварийного выхода процесса, рестарта Docker или обычного `reboot` VM bridge должен подняться сам.
+- Явный `docker compose stop` останавливает контейнер, а `docker compose down` ещё и удаляет его; оба варианта останавливают внутренние watchdog-и и не отменяются `restart: always`. Восстановление: `docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml up -d bridge`.
+- Теперь PID1 внутри контейнера — supervisor. Даже если MAX/TG интеграция деградирует, контейнер должен оставаться `Up`, а проблема должна отражаться в `data/health_state.json` и в ops-алертах.
+- Worker restarts идут с exponential backoff + jitter и cap 300s; одинаковые health issue signatures не должны спамить owner DM, потому `RuntimeHealthStore` отправляет alert только при изменении причины, а reminder остаётся отдельным периодическим статусом.
+
+### Границы watchdog
+
+Внутренние watchdog-и находятся на Hetzner production VPS и **восстанавливают**;
+внешний наблюдатель находится на втором VPS и только **сообщает**.
+
+| Уровень | Где работает | Что делает | Ограничение |
+|---------|--------------|------------|-------------|
+| `BridgeSupervisor` | PID1 внутри `bridge` Docker-контейнера | Перезапускает аварийно завершившийся worker с backoff | Не работает, если контейнер остановлен |
+| MAX watchdog | Background task внутри того же worker | Зависший MAX при успешном egress probe: rate-limited self-exit, затем Docker restart | Не работает при остановленном worker/container; не делает SMS reauth и не меняет egress profile |
+| Docker `restart: always` | Docker Engine того же VPS | Unexpected process exit, restart Docker или VM | Не отменяет явный `docker compose stop`/`down` |
+| Docker `HEALTHCHECK` | Docker Engine того же VPS | Ничего: только помечает stale heartbeat как `unhealthy` | Не перезапускает unhealthy контейнер |
+| Внешний watchdog (L2/L3) | Контейнер `maxtg-watchdog` на **втором VPS** | Замечает остановленный контейнер, мёртвый хост, протухший heartbeat, сломанную доставку алертов — и пишет в Telegram с префиксом `[EXT]` | Ничего не чинит: ключ привязан к read-only пробе |
+| Мета-мониторинг (L4) | `vps-monitor` на хосте наблюдателя + встречная проба | Замечает смерть самого наблюдателя | Не переживёт смерть обоих хостов |
+
+Host-level `systemd` service/timer, который сам поднимал бы контейнер после
+ручной остановки, по-прежнему нет — это сознательно: внешний слой превращает
+такую остановку в громкий алерт `container_down`, а поднимает контейнер человек.
+Не запускай второй bridge instance: для восстановления используй только команду
+выше или штатный Ansible deploy.
+
+Полная модель отказов, пороги, каталог алертов и учения —
+[docs/runbooks/watchdog.md](watchdog.md).
+
+### MAX egress / Channel M
+
+Production MAX egress должен быть явным:
+
+```yaml
+max:
+  egress:
+    active: "home_ru_proxy"
+    fallback_policy: "manual"
+    profiles:
+      home_ru_proxy:
+        type: "http_connect"
+        proxy_url: "${MAX_EGRESS_PROXY_URL}"
+      hetzner_direct:
+        type: "direct"
+```
+
+`home_ru_proxy` отправляет только MAX API/CDN трафик через authenticated HTTP CONNECT к VPS-local reverse Channel M listener. Этот listener держится исходящим SSH remote-forward с домашнего роутера; дальше роутер выпускает трафик через домашний РФ WAN. Telegram polling/send остаётся прямым Hetzner-трафиком. Домашняя LAN/Wi-Fi и GhostRoute Channel A/B/C routing этим не меняются.
+
+`hetzner_direct` — ручной аварийный режим. Он включается только изменением `max.egress.active: "hetzner_direct"` оператором и должен быть виден в `/status` как warning `MAX uses non-RU direct egress`. Автоматического fallback нет: если `home_ru_proxy` недоступен, MAX показывает issue `max_egress_unavailable`/degraded, но bridge не переключает MAX на direct сам.
+
+Когда MAX offline и активен `home_ru_proxy`, watchdog делает безопасный egress
+probe: TCP до proxy, HTTP CONNECT к `api.oneme.ru:443`, затем TLS handshake с
+SNI. После reboot VPS bridge может стартовать раньше, чем домашний reverse
+Channel M заново откроет listener на docker bridge. В течение
+`health.max_egress_startup_grace_seconds` такой `ConnectionRefused` считается
+startup wait: health получает `max_egress_startup_wait` без owner alert, а
+bridge продолжает reconnect. После grace обычный fail-closed режим возвращается:
+если proxy/TLS не проходит, health получает `max_egress_unavailable` и bridge
+продолжает reconnect. Если proxy/TLS уже healthy, но pymax не дошёл до
+`on_start` после self-heal grace window, bridge записывает
+`data/max_egress_self_heal.json` и завершает процесс с rate limit; Docker
+`restart: always` поднимает свежий процесс. Это self-heal только для зависания
+процесса, не fallback на другой egress.
+
+Для применения reverse Channel M на VPS используется `infra/ansible/channel-m-reverse.yml`: он берёт gitignored artifact из `router_configuration`, обновляет `MAX_EGRESS_PROXY_*`, пересоздаёт контейнер и проверяет socket CONNECT к MAX изнутри bridge.
+
+Схема окружения, владельцы и нужные переменные описаны в
+[../environment-inventory.md](../environment-inventory.md). Коротко:
+
+```text
+bridge container -> VPS docker bridge listener -> router SSH remote-forward
+                 -> router Channel M reverse inbound -> home WAN РФ -> MAX
+Telegram traffic -> direct VPS HTTPS -> Telegram
+```
+
+## Запуск / Остановка
+
+```bash
+# Запуск (фоновый, с логом)
+cd /path/to/maxtg_bridge
+nohup .venv/bin/python -m src.main >> data/bridge.log 2>&1 &
+
+# Проверить что работает
+ps aux | grep 'python -m src.main' | grep -v grep
+tail -20 data/bridge.log
+
+# Остановить
+kill $(ps aux | grep 'python -m src.main' | grep -v grep | awk '{print $2}')
+
+# Перезапуск
+kill $(ps aux | grep 'python -m src.main' | grep -v grep | awk '{print $2}')
+sleep 2
+nohup .venv/bin/python -m src.main >> data/bridge.log 2>&1 &
+```
+
+**ВАЖНО:** Никогда не запускать два экземпляра одновременно — два userbot = проблемы с MAX.
+
+## Проверка здоровья
+
+```bash
+# Последние события
+tail -50 data/bridge.log
+
+# Статистика доставки
+.venv/bin/python -c "
+import asyncio, aiosqlite
+
+async def main():
+    db = await aiosqlite.connect('data/bridge.db')
+    db.row_factory = aiosqlite.Row
+    print('=== Bindings ===')
+    async with db.execute('SELECT * FROM chat_bindings') as cur:
+        for r in await cur.fetchall():
+            print(dict(r))
+    print('=== Recent deliveries ===')
+    async with db.execute('SELECT * FROM delivery_log ORDER BY created_at DESC LIMIT 10') as cur:
+        for r in await cur.fetchall():
+            print(dict(r))
+    await db.close()
+
+asyncio.run(main())
+"
+```
+
+Для production на Hetzner удобнее использовать:
+
+```bash
+ssh -i ~/.ssh/id_rsa deploy@<SERVER_IP>
+cd /opt/maxtg-bridge
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+Дополнительные runtime-артефакты:
+
+- `data/health_state.json` — текущий persisted health snapshot supervisor-а
+- `data/health_events.jsonl` — история переходов `healthy/degraded/recovering/recovered`
+- `data/alert_outbox.jsonl` — системные алерты, которые не удалось отправить в Telegram сразу
+- `data/health_heartbeat.json` — heartbeat для Docker healthcheck
+- `data/session_backups/` — ring-buffer валидных MAX `session.db` snapshots; содержит auth token, права должны оставаться `0700/0600`
+
+Быстрая диагностика:
+
+```bash
+cd /opt/maxtg-bridge
+jq . data/health_state.json
+tail -50 data/health_events.jsonl
+wc -l data/alert_outbox.jsonl
+jq . data/health_heartbeat.json
+```
+
+Как интерпретировать:
+
+- контейнер `Up` + healthcheck `healthy` + `health_state.json` с `overall_status=degraded` означает: supervisor жив, но одна из подсистем сломана
+- если `alert_outbox.jsonl` не пустой, Telegram ops-уведомления не ушли сразу и ждут автоматической досылки
+- если проблема в MAX session, `/status` и `health_state.json` должны явно показывать `requires_reauth` / подсказку про SMS reauth
+- при порче SQLite header у `data/session.db` bridge сначала пробует восстановить текущий token в clean copy; если не выходит — откатывается на свежий валидный snapshot из `data/session_backups/`
+- по умолчанию outbox относится к owner DM; forum-topic fanout участвует только если настроен `ops_topic_id`
+
+## MAX account recovery registry
+
+Recovery registry нужен на случай нового телефона / нового MAX account. Он сохраняет не сообщения, а маршрутную карту восстановления: какие Telegram topics соответствуют MAX чатам, какие чаты требуют invite/admin, где есть invite link, кто owner/admin, какие личные DM contacts реально были в общении, и насколько свежий последний snapshot.
+
+Что хранится в `data/bridge.db`:
+
+- `max_account_generations` — поколения MAX аккаунта: `max_user_id`, masked phone, hash fingerprint сессии, статус и first/last seen.
+- `chat_recovery_registry` — topic/chat registry: `tg_topic_id`, старый/текущий `max_chat_id`, тип чата, mode, access, invite link, owner/admin contacts, DM partner, participant count, manual note, recovery status, `last_scan_at`.
+- `dm_contact_recovery_registry` — DM-only контакты для восстановления: `max_user_id`, display name, старый/текущий DM chat id, связанный Telegram topic, source, recovery status и `last_scan_at`. Источник — только typed dialog snapshots и уже привязанные DM topics; полная MAX address book (`client.contacts`) и `known_users` сюда не копируются.
+- `chat_recovery_events` — audit событий scan/set/remap/account change без текста сообщений и raw payload.
+
+Этот registry остаётся маршрутной картой даже без телефонов: он помогает понять, какие старые DM topics надо remap-нуть после появления нового `max_chat_id`. Автоматический импорт на новый номер — отдельный слой ниже и возможен только для контактов, где PyMax отдаёт `User.phone`.
+
+Отдельный encrypted snapshot для переноса на новый номер:
+
+- обычный full backup должен включать `.env`, `.env.secrets`, `.env.host`, `config.local.yaml` и весь `data/`;
+- `data/recovery_contacts.enc.json` — дополнительный encrypted input для PyMax `import_contacts()`;
+- ключ шифрования `MAX_RECOVERY_CONTACTS_KEY` хранится только в `.env.secrets`;
+- открытая часть snapshot содержит только schema version, cipher, timestamp, source MAX account hash, aggregate counts, validation metadata и ciphertext;
+- encrypted payload формируется из текущего PyMax user/contact cache и содержит только поля phone/display-name, которые нужны PyMax `ContactInfo` для `import_contacts()`;
+- телефоны не попадают в `bridge.db`, `/status`, `/recovery report`, обычный `/recovery export`, logs, health/events, message text/media/raw payload;
+- контакты из DM registry, group participants или `known_users`, для которых PyMax не отдаёт `User.phone`, не могут быть автоматически импортированы и остаются manual recovery/remap cases.
+
+Команды владельца:
+
+```text
+/recovery scan
+/recovery report
+/recovery export
+/recovery contacts status
+/recovery contacts snapshot [--force]
+/recovery contacts import dry-run|apply
+/recovery set <topic_id> key=value ...
+/recovery remap <topic_id> <new_max_chat_id>
+```
+
+Полезные поля для `/recovery set`: `priority=9`, `status=manual_admin_required`, `note="попросить инвайт у Анны"`, `link=https://...`, `admin="Анна:12345"`, `owner="Олег:777"`.
+
+Периодичность и auto-refresh:
+
+- после успешного MAX connect bridge запускает безопасный recovery scan;
+- дополнительно раз в неделю запускается `weekly_recovery_snapshot` как safety net;
+- event-driven scan запускается асинхронно при важных MAX-side изменениях: создан новый `ChatBinding`, обновился fallback title, пришёл MAX `CONTROL` event;
+- `new_binding` ставит high-priority scan примерно через 60 секунд и bypass cooldown; `title_changed` схлопывается коротким debounce; `control_event` имеет cooldown, чтобы не спамить MAX API;
+- forwarding сообщений, создание topics и rename не ждут snapshot: scheduler ставит background task, а обычный routing продолжает работу;
+- тот же scan обновляет DM contacts из реальных dialogs only; при новом MAX account старые невидимые DM contacts остаются в registry как `account_migration_required`/`needs_contact`, а видимый contact с другим DM chat id требует ручного `remap`;
+- `/recovery report` показывает `Свежесть snapshot`, агрегаты `DM contacts`/`linked topics`/`needs contact/remap` и безопасную сводку действий; названия, MAX ids, invite/admin/DM details остаются только в `/recovery export`;
+- `/recovery export` отправляет владельцу JSON в DM, включая invite links/admin notes и полный DM contact snapshot, поэтому не пересылай export в общие чаты.
+
+Auto notifications/status:
+
+- автоматические scans больше не пишут отдельный alert для обычных дельт: новый/unmapped чат, `needs_invite`, `manual_admin_required` или изменение статусов DM contacts попадают агрегатами в 4-часовой `/status`;
+- отдельный owner/ops alert отправляется только при `account_migration_required`;
+- status/notification содержит только counts/statuses и подсказку открыть `/recovery report`;
+- invite links, admin/manual notes, phone numbers, message text, DM contact names, raw MAX fields и signed URLs не попадают в notification/log/health;
+- одинаковый migration notification digest дедупится in-memory примерно на 24 часа.
+
+Когда запускать `/recovery scan` вручную:
+
+- сразу после reauth на новый телефон/MAX account;
+- если `/recovery report` показывает устаревший `last_scan_at`;
+- после того как админ пригласил новый аккаунт в закрытый чат;
+- после ручного исправления notes/link/admin через `/recovery set`, если нужно сверить видимость текущего аккаунта.
+
+Новый телефон / новый MAX account:
+
+1. До миграции: сделать full backup, убедиться что `MAX_RECOVERY_CONTACTS_KEY` есть в `.env.secrets`, затем выполнить `/recovery contacts snapshot`.
+2. После reauth с новым номером: выполнить `/recovery scan`.
+3. Выполнить `/recovery contacts import dry-run`; если counts ожидаемые, выполнить `/recovery contacts import apply`.
+4. Посмотреть `/recovery report`: `unmapped` — MAX чаты, видимые новому аккаунту, но ещё не привязанные к старым Telegram topics; `есть invite link` / `нужен админ` — ручные шаги доступа; `DM contacts` / `needs contact/remap` — личные собеседники, которых нужно найти/написать первым сообщением или вручную привязать к старому topic. Для названий, MAX ids и invite/admin/DM деталей используй `/recovery export`, который уходит владельцу в DM.
+5. После invite/join или появления нового DM chat id выполнить `/recovery remap <topic_id> <new_max_chat_id>`.
+6. Старый `message_map` остаётся для истории, но reply на старое TG сообщение после remap уходит в MAX без `reply_to`, если исходный MAX message был в старом `max_chat_id`.
+
+## Сценарии отказов
+
+Ниже короткая operator-матрица: что ломается, что система делает сама и когда нужен ручной шаг.
+
+| Сценарий | Что делает система автоматически | Куда пишет | Нужен ли ручной шаг |
+|---------|----------------------------------|------------|---------------------|
+| `MAX disconnected` / краткий сетевой обрыв | MAX adapter держит reconnect-loop, supervisor не даёт контейнеру упасть, health переходит в `degraded`, после восстановления фиксируется `recovered` | owner DM, `health_state.json`, `health_events.jsonl` | Обычно нет |
+| MAX reconnect длится слишком долго | bridge остаётся `Up`, watchdog и health snapshot показывают деградацию; если `home_ru_proxy` healthy и self-heal ещё ожидается, owner DM не шлётся до self-heal/реальной ручной ситуации | `/status`, `health_state.json`, owner DM только после self-heal/failure | Иногда да, если внешний MAX реально недоступен долго |
+| Event-driven recovery snapshot не собрался | forwarding не блокируется; bridge пишет безопасный warning и ждёт следующий event/weekly/manual scan | logs, `/recovery report` freshness | Да, если свежесть критична: выполни `/recovery scan` |
+| Битый SQLite header у `data/session.db` | перед стартом MAX-клиента runtime пробует пересобрать clean `session.db` из текущего token; при успехе сохраняет битый файл в `data/session_backups/` и продолжает старт | logs, `data/session_backups/`, затем recovered health event | Обычно нет |
+| `Invalid token` / нечитаемая MAX session без валидного snapshot / нужен `reauth` | runtime не падает, проблема классифицируется как issue MAX-сессии, оператор получает подсказку про SMS reauth | owner DM, `/status`, `health_state.json`, `health_events.jsonl` | Да, нужен `/reauth` и SMS-код |
+| Telegram Bot API временно недоступен | `TelegramAdapter` делает retry, неотправленные системные alert-сообщения кладутся в `alert_outbox.jsonl`, после восстановления Telegram идёт automatic flush | owner DM после восстановления, `alert_outbox.jsonl`, `health_state.json` | Обычно нет |
+| MAX→TG текст не доставился из-за временного сбоя Telegram | текстовое сообщение кладётся в `pending_inbound_messages`, worker досылает его с backoff и очищает plaintext после доставки/TTL | `/status`, `pending_inbound_messages`, `delivery_log` | Нет, если Telegram восстановился до TTL |
+| TG→MAX текст точно не ушёл из-за MAX transport | текстовое сообщение кладётся в `pending_outbound_messages`, worker ждёт healthy MAX и досылает его; plaintext очищается после доставки/TTL | Telegram topic notice, `/status`, `pending_outbound_messages`, `delivery_log` | Нет, если MAX восстановился до TTL |
+| Падает сам bridge worker | supervisor перезапускает worker с backoff, контейнер остаётся `Up`, restart counter и причина попадают в health-state | owner DM, `health_state.json`, `health_events.jsonl` | Обычно нет, если crash разовый |
+| PID1 supervisor аварийно завершился | Процесс контейнера завершится; Docker `restart: always` создаст новый container process | `docker ps`, `docker inspect`, `health_heartbeat.json` | Обычно нет, если restart успешен |
+| PID1 supervisor завис, но процесс не завершился | Docker healthcheck пометит контейнер `unhealthy`; автоматического restart от healthcheck нет | `docker ps`, `docker inspect`, `health_heartbeat.json` | Да: controlled `docker compose ... up -d bridge`/Ansible deploy или внешний host watchdog |
+| Bridge остановлен явным `docker compose stop`/`down` | Ничего: supervisor и MAX watchdog уже не выполняются, а Docker считает stop намеренным | `docker compose ps`, Docker events | Да: `docker compose ... up -d bridge`, затем healthcheck и smoke-check |
+| Telegram-уведомление не удалось отправить сразу | сообщение не теряется, а сохраняется в outbox и досылается позже | `alert_outbox.jsonl` | Нет, если Telegram восстановился |
+| MAX лежал долго и потом поднялся | bridge пытается восстановиться сам и шлёт `recovered`, но исторические сообщения за время простоя MAX не догружаются | owner DM, `/status`, `health_events.jsonl` | Возможно, если критично вручную проверить пропущенный период |
+
+Что важно помнить:
+
+- Автовосстановление покрывает временные transport/runtime проблемы, reconnect и crash worker.
+- Автовосстановление не может само пройти SMS reauth за владельца.
+- Даже при исправном runtime pymax не умеет полноценный history replay, поэтому сообщения за длительный downtime MAX могут быть потеряны.
+
+## Режимы логирования
+
+Поддерживаются env-переключатели:
+
+```bash
+LOG_LEVEL=INFO|DEBUG
+LOG_FORMAT=text|json|mixed
+LOG_PREVIEW_CHARS=120
+LOG_LIBRARIES_DEBUG=0|1
+LOG_TO_FILE=1|0
+LOG_FILE=/custom/path/bridge.log
+```
+
+Рекомендуемый production-режим:
+
+```bash
+LOG_LEVEL=INFO
+LOG_FORMAT=mixed
+LOG_LIBRARIES_DEBUG=0
+LOG_TO_FILE=1
+```
+
+Для детальной диагностики конкретного кейса:
+
+```bash
+LOG_LEVEL=DEBUG
+LOG_FORMAT=mixed
+LOG_PREVIEW_CHARS=120
+```
+
+Что важно:
+
+- на `INFO` логируются route/outcome/meta без полного текста сообщений
+- на `DEBUG` появляются safe preview текста
+- `LOG_LIBRARIES_DEBUG=1` поднимает `pymax`/`aiogram`, использовать только временно
+- по умолчанию лог пишется и в stdout, и в `${DATA_DIR}/bridge.log` (`./data/bridge.log` локально)
+
+## Как искать трассу сообщения
+
+Основные поля в логах:
+
+- `event=...`
+- `flow_id=mx:<chat_id>:<msg_id>` для MAX -> Telegram
+- `flow_id=tg:<topic_id>:<tg_msg_id>` для Telegram -> MAX
+
+Быстрые команды:
+
+```bash
+# все шаги по конкретному MAX-сообщению
+rg 'flow_id=mx:-70000000000003:4242' data/bridge.log
+
+# все шаги по конкретному Telegram-сообщению
+rg 'flow_id=tg:99:777' data/bridge.log
+
+# только завершения маршрута
+rg 'event=bridge\.(inbound|outbound)\.forward_finished' data/bridge.log
+
+# только retry/fail отправки в Telegram
+rg 'event=tg\.outbound\.(retry|failed|sent)' data/bridge.log
+
+# retry/fail отправки из Telegram в MAX
+rg 'event=max\.outbound\.(retry|failed|sent)' data/bridge.log
+
+# retry/resume/fail скачивания MAX-вложений
+rg 'event=max\.attachment\.(download|download_retry|download_resume|video_fallback|audio_fallback|voice_reference_missing)' data/bridge.log
+
+# voice diagnostics/recovery for pymax-empty events
+rg 'event=max\.(raw|inbound)\.(empty_message|empty_recovery|auxiliary_event|handler_registered|interceptor_installed)' data/bridge.log
+
+# forwarded/channel wrappers that looked empty before recovery unwrap
+rg 'event=max\.inbound\.empty_recovery.*reason=.*(without_content|durable_history_retry|raw_recent_history_match|recent_history_match)' data/bridge.log
+rg 'event=max\.raw\.message_skipped.*reason=missing_chat_id' data/bridge.log
+
+# последние неуспешные TG -> MAX доставки из SQLite
+sqlite3 -header -column data/bridge.db \
+  "SELECT max_msg_id, max_chat_id, error, attempts, datetime(created_at, 'unixepoch', 'localtime') AS created_local \
+   FROM delivery_log \
+   WHERE direction='outbound' AND status='failed' \
+   ORDER BY created_at DESC LIMIT 20"
+
+# pending TG -> MAX тексты, которые будут досланы после восстановления MAX
+sqlite3 -header -column data/bridge.db \
+  "SELECT id, tg_topic_id, tg_msg_id, max_chat_id, status, attempts, \
+          datetime(next_attempt_at, 'unixepoch', 'localtime') AS next_local, last_error \
+   FROM pending_outbound_messages \
+   WHERE status IN ('pending', 'retry', 'leased') \
+   ORDER BY next_attempt_at ASC LIMIT 20"
+
+# pending MAX -> TG тексты, которые будут досланы после восстановления Telegram
+sqlite3 -header -column data/bridge.db \
+  "SELECT id, max_chat_id, max_msg_id, tg_topic_id, status, attempts, \
+          datetime(next_attempt_at, 'unixepoch', 'localtime') AS next_local, last_error \
+   FROM pending_inbound_messages \
+   WHERE status IN ('pending', 'retry', 'leased') \
+   ORDER BY next_attempt_at ASC LIMIT 20"
+```
+
+Если в MAX видно forwarded/channel сообщение с текстом, фото или видео, а в Telegram нет
+доставки и в `message_map`/`delivery_log` нет свежей inbound-записи, сначала ищи
+безопасные markers в логах:
+
+- `max.inbound.empty_recovery reason=raw_recent_history_match_without_content` или `recent_history_match_without_content` — recovery видел candidate, но прежний content-check мог сработать до unwrap;
+- `max.inbound.empty_recovery reason=durable_history_retry` / `outcome=recovered` — meta-only retry перечитал history и нашел доставляемый payload;
+- `max.raw.message_skipped reason=missing_chat_id` вместе с `message_type=CHANNEL/FORWARD` и safe `payload_fields`/`message_fields` — raw receive увидел wrapper с контентом, но не смог построить routable message;
+- безопасные поля-симптомы: `link`, `attaches`, `_forward_source_chat_id`, `_forward_source_msg_id`, `_forward_link_type`, `type=CHANNEL/FORWARD`.
+
+Не копировать в issue/log dump текст сообщения, raw MAX payload, signed media URL,
+invite links или tokens. Для восстановления достаточно `flow_id`,
+`max_chat_id`, `max_msg_id`, `tg_topic_id`, `event`, `reason`, `outcome` и safe
+field names.
+
+Для обычной пересылки Telegram показывает `↪️ Переслано из «…»`, если MAX
+передал `ForwardLink.chat_name`; если его нет, используется локальный MAX cache.
+Bridge не делает live MAX lookup ради подписи, не создаёт отдельную SQLite-запись
+и не пишет название в логи; при payload/cache miss остаётся `↪️ Переслано из MAX`.
+Если Telegram временно недоступен, marker попадает в уже существующий plaintext
+text-retry payload и удаляется по обычному delivery/TTL правилу.
+
+Полезные `event`-группы:
+
+- `max.inbound.*` — что пришло из MAX и как нормализовали
+- `bridge.inbound.*` — routing/dedup/topic resolution для MAX -> TG
+- `bridge.inbound_retry.*` — durable retry MAX -> TG текстов
+- `tg.outbound.*` — отправка в Telegram, retry и fail
+- `tg.inbound.*` — что пришло из Telegram и скачивание медиа
+- `bridge.outbound.*` — routing/reply resolution и доставка TG -> MAX
+- `bridge.outbound_retry.*` — durable retry TG -> MAX текстов
+
+## Reason codes
+
+Нормальные/ожидаемые:
+
+- `duplicate`
+- `empty_event`
+- `readonly`
+- `disabled`
+
+Требуют внимания:
+
+- `no_topic`
+- `too_large`
+- `tg_send_failed`
+- `max_send_failed`
+- `download_rejected`
+- `download_failed`
+- `ack_timeout`
+
+## Видео и большие вложения MAX
+
+MAX-видео приходят через signed CDN URL. Bridge выбирает `User-Agent` по `srcAg` в URL (`CHROME`, `CHROME_ANDROID`, `CHROME_IPHONE`, Safari/iPhone fallback), потому что OK CDN может отвечать `400 Bad Request` на неподходящий клиент.
+
+Загрузка медиа:
+
+- до 7 попыток на файл;
+- файл пишется во временный `*.part`;
+- при обрыве следующая попытка отправляет `Range: bytes=<уже_скачано>-`;
+- если CDN не поддерживает `Range` и отвечает `200`, bridge удаляет `*.part` и качает заново;
+- если прямой URL видео не скачался, bridge пробует fallback через MAX `VIDEO_PLAY`;
+- live-вложения `type=UNSUPPORTED` не считаются terminal unsupported сразу: adapter сначала разворачивает nested `payload` и по `audioId`/`fileId`/`photoId`/`baseUrl`/filename/url hints переклассифицирует их в `AUDIO`/`FILE`/`PHOTO`/`VIDEO`;
+- если медиа не скачалось сразу, bridge отправляет остальные части сообщения и кладёт meta-only job в `pending_media_downloads`; для video placeholder честно указывает окно до 18 минут, для остальных media не обещает «пару минут»;
+- для проблемных media (`UNSUPPORTED`, download failure, partial delivery) bridge дополнительно пишет `media_recovery_cache`: stable refs/filename/duration/size как meta, а volatile URL/payload hints только Fernet ciphertext через `MAX_RECOVERY_CONTACTS_KEY`; TTL по умолчанию 48ч (`bridge.media_recovery_cache_ttl_hours`);
+- для фото/файлов без стабильного download reference этот job служит delayed-finalizer: если late duplicate/raw recovery не доставил media за несколько минут, bridge отправит terminal warning `⚠️ ... так и не удалось загрузить автоматически`;
+- успешная доставка каждого media part пишется в `delivered_media_parts` по canonical base `max_msg_id`, `attachment_index` и `kind`; таблица хранит только meta (`tg_msg_id`, topic/source, stable media reference если он есть), без текста, raw payload, signed URL или token;
+- edit-events из PyMax могут приходить как `MessageStatus.EDITED` или `EDITED`; bridge нормализует их в один status/base id и сверяет вложения per-index/per-kind. Уже доставленные фото/видео/аудио/файлы не пересылаются, новые вложения досылаются, terminal warning остаётся только для реально недоставленных indices. В логах это видно как `bridge.media_retry.suppressed reason=media_part_already_delivered` или legacy fallback `edit_base_media_already_delivered`;
+- video job после initial failure делает ещё 6 deferred attempts ровно каждые 180 секунд; после шестого failure переходит в `failed` и отправляет terminal warning. Это отдельно от внутренних HTTP download retries одного файла. Photo/audio stable-reference jobs сохраняют прежний exponential backoff;
+- повторный sweep той же voice/media-reference не отправляет второй queued-placeholder: существующий pending job переиспользуется по `media_chat_id/media_msg_id/attachment_index/kind/reference_*`;
+- для degraded `CHANNEL/FORWARD` wrappers bridge принимает recovery только если payload содержит usable media refs; low-quality `PHOTO`/`VIDEO` без refs не занимает dedup partial сразу, а ждёт raw/history cache до короткого timeout;
+- если первый проход всё же дал `partial attachment_download_failed:*`, а поздний duplicate уже содержит скачанные фото/видео, bridge best-effort досылает только ещё не записанные media parts в тот же Telegram topic, пишет `delivery_log.error=late_media_recovered`, `delivered_media_parts` и `tg_reply_map` для reply routing;
+- retry worker для фото со stable `fileId`/`photoId` заново получает signed URL через safe `FILE_DOWNLOAD` и скачивает файл без сохранения URL; для cache-only `FILE` сначала использует encrypted signed URL hint, затем при наличии `fileId` применяет typed `get_file_by_id()` и, только если тот вернул пустой URL, подтверждённый raw `FILE_DOWNLOAD` payload (`chatId`, `messageId`, `fileId`). Если source coordinates cache-only media не дали файл, worker повторяет cache recovery по receiving wrapper coordinates. Для video сначала вызывает public PyMax 2.4.1 `get_video_by_id()` и берёт typed `.url`, затем пробует isolated raw `VIDEO_PLAY` fallback; для forwarded video пробует source chat/message pair, затем receiving wrapper pair. Для голосовых заново читает raw `CHAT_HISTORY`, пробует exact `MSG_GET` только в одиночной форме `messageId`, dialog cache, MAX Web `audioGetSources` (`opcode=301) и только затем известный pymax/userbot-safe `FILE_DOWNLOAD` payload (`fileId`) + legacy pymax `get_file_by_id`; если stable ref/history не сработали, worker пробует encrypted `media_recovery_cache` payload без логирования URL/payload. `audioId`/token payload для `FILE_DOWNLOAD`, а также `MSG_GET` shapes `messageIds`/`ids`, в prod возвращали `proto.payload` и закрывали socket, поэтому они отключены.
+
+Что смотреть в логах:
+
+```bash
+rg 'flow_id=mx:<chat_id>:<msg_id>' data/bridge.log
+rg 'event=bridge\.media_retry\.suppressed .*(media_part_already_delivered|edit_base_media_already_delivered)' data/bridge.log
+rg 'event=max\.attachment\.(download|download_retry|download_resume|video_fallback|audio_fallback|audio_protocol_probe|voice_reference_missing)' data/bridge.log
+rg 'event=bridge\.media_retry\.(enqueued|attempt_started|retry_scheduled|delivered|failed)' data/bridge.log
+rg 'event=bridge\.media_recovery_cache\.(saved|attempt_started|recovered)' data/bridge.log
+rg 'event=bridge\.inbound\.late_media_recovery|event=max\.inbound\.degraded_media_recovery' data/bridge.log
+rg 'event=bridge\.inbound\.forward_finished .*outcome=partial' data/bridge.log
+```
+
+Для CDN download-ошибок смотри поля `src_ag`, `ua_family`, `http_status` и `download_source`. Signed query-параметры URL в логах не должны появляться.
+Для degraded/late recovery логи содержат только meta (`chat_id/msg_id`, типы вложений, counts, outcome/reason), без raw payload и текста сообщения.
+
+Очередь durable media retry:
+
+```bash
+sqlite3 -header -column data/bridge.db \
+  "SELECT id, max_msg_id, max_chat_id, attachment_index, status, attempts, datetime(next_attempt_at, 'unixepoch', 'localtime') AS next_local, last_error \
+   FROM pending_media_downloads \
+   WHERE status IN ('pending','retry','leased') \
+   ORDER BY next_attempt_at LIMIT 20"
+```
+
+Точечный перезапуск одной video-job после исправления downloader (только после full backup и точной meta-only идентификации row):
+
+```bash
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml stop bridge
+sqlite3 data/bridge.db \
+  "UPDATE pending_media_downloads
+   SET status='retry', attempts=0, next_attempt_at=strftime('%s','now'),
+       lease_until=NULL, last_error='operator_retry_after_fix'
+   WHERE id=<job_id> AND kind='video'
+     AND status IN ('pending','retry','leased','failed');"
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml up -d bridge
+```
+
+Не делать bulk update и не сбрасывать `delivered` row: это может дать дубль в Telegram. После старта ждать `bridge.media_retry.delivered` либо bounded terminal event.
+
+Уже доставленные media parts по конкретному MAX message:
+
+```bash
+sqlite3 -header -column data/bridge.db \
+  "SELECT base_max_msg_id, attachment_index, kind, tg_msg_id, source, media_msg_id, reference_kind \
+   FROM delivered_media_parts \
+   WHERE max_chat_id='<chat_id>' AND base_max_msg_id='<base_msg_id>' \
+   ORDER BY attachment_index, kind"
+```
+
+Временный media recovery cache:
+
+```bash
+sqlite3 -header -column data/bridge.db \
+  "SELECT max_msg_id, attachment_index, kind, source_type, reference_kind,
+          datetime(expires_at, 'unixepoch', 'localtime') AS expires_local,
+          payload_cipher IS NOT NULL AS has_encrypted_payload
+   FROM media_recovery_cache
+   ORDER BY expires_at DESC LIMIT 20"
+```
+
+Точечная операторская переотправка старого MAX-вложения:
+
+```bash
+# Важно: не запускать одновременно со штатным bridge-контейнером.
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml stop bridge
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml run --rm --no-deps bridge \
+  env PYTHONPATH=/app python scripts/operator_replay_max_messages.py \
+  --chat-id=<max_chat_id> \
+  --msg-id <max_msg_id> \
+  --limit 100
+docker compose --project-name deploy --env-file .env.host -f deploy/docker-compose.prod.yml up -d bridge
+```
+
+`operator_replay_max_messages.py` принимает только explicit ids, не печатает текст/raw payload/URL/token и гонит найденные сообщения через обычный bridge pipeline. По умолчанию он временно помечает существующие `delivery_log` rows как `partial attachment_download_failed:forced_replay_unsupported`, чтобы штатный late-media recovery дослал media в тот же Telegram topic. Для новых failures после включения cache worker может использовать encrypted `media_recovery_cache` до TTL. Для старых failures, которые произошли до появления cache, если MAX больше не отдаёт message через history/exact lookup, восстановить вложение нечем: bridge не хранит full raw payload или сам файл после failed unsupported fallback.
+
+В `delivery_log` для частичной доставки:
+
+```bash
+sqlite3 -header -column data/bridge.db \
+  "SELECT max_msg_id, max_chat_id, status, error, datetime(created_at, 'unixepoch', 'localtime') AS created_local \
+   FROM delivery_log \
+   WHERE direction='inbound' AND status='partial' \
+   ORDER BY created_at DESC LIMIT 20"
+```
+
+## Базовая живая smoke-проверка на тестовых чатах
+
+Этот сценарий нужен после деплоя или после правок в routing.
+
+### Подготовка
+
+- выдели 1 тестовый MAX-чат или DM
+- дождись, чтобы для него уже существовал Telegram topic
+- не используй прод-критичный чат для первой проверки
+
+### Проверка 1: MAX -> Telegram
+
+1. Отправь в тестовый MAX-чат короткий текст, например: `SMOKE MAX -> TG`.
+2. Убедись, что он появился в соответствующем Telegram topic.
+3. Если это группа, проверь что в Telegram есть префикс отправителя `[Имя]`.
+
+### Проверка 1b: MAX video -> Telegram
+
+1. Отправь короткое видео в тестовый MAX-чат или DM.
+2. Убедись, что в Telegram оно пришло именно видео-сообщением.
+3. В логах проверь `max.attachment.download outcome=downloaded`, затем `tg.outbound.sent media_type=video`.
+4. Если пришёл текст `⏳ Видео MAX #N докачивается...`, проверь `bridge.media_retry.enqueued`, затем `bridge.media_retry.delivered` и `tg.outbound.sent media_type=video`.
+5. Повторы должны идти с полем `retry_in_seconds=180`; после шестого deferred failure ищи `bridge.media_retry.failed reason=video_retry_exhausted` и `pending_media_downloads.last_error=video_retry_exhausted:*`.
+
+### Проверка 1c: MAX voice -> Telegram
+
+1. Отправь короткое голосовое в тестовый MAX DM.
+2. Убедись, что в Telegram topic пришёл native voice bubble.
+3. В логах проверь `attachment_types=["AUDIO"]` или `["VOICE"]`, затем `tg.outbound.sent media_type=voice`.
+4. Если MAX сначала отдаёт пустой typed `USER`, bridge делает recent-history recovery. Успешный raw-history путь виден как `max.raw.history_fetch outcome=received`, затем `max.inbound.empty_recovery outcome=recovered reason=raw_recent_history_match`, `raw_history_cache_match` или `raw_history_cache_after_fetch_error`.
+5. Если raw `CHAT_HISTORY` задержался, bridge до 180 секунд держит in-memory wait job: сначала `max.inbound.empty_recovery outcome=queued reason=raw_history_cache_wait`, затем при успехе `reason=raw_history_cache_delayed_match`.
+6. Если MAX/history всё ещё отдаёт пустой message без `attaches`, bridge кладёт meta-only retry в `data/pending_empty_recoveries.json` и перечитывает history без лимита по времени. Ищи `reason=durable_history_retry`, `retry_scheduled`, затем при успехе `durable_history_recovered`.
+7. `bridge.dm_history_sweep.worker_started` перечитывает последние сообщения активных DM за окно 48 часов и досылает пропущенные сообщения через обычный dedup path. Нагрузка регулируется `health.dm_history_sweep`: balanced default — 120 секунд в первые 10 минут после старта/reconnect, затем 900 секунд steady, `limit=30`, jitter до 30 секунд и 0.5 секунды между чатами. При успехе ищи `bridge.dm_history_sweep.cycle_finished`, `max.history_sweep.replayed` и `tg.outbound.sent media_type=voice`; уже известные `(chat_id,msg_id)` пропускаются до тяжёлой нормализации/скачивания. Если в логах PyMax появляется `unhashable type: 'list'` на `CHAT_HISTORY`, это regression в backend msgpack guard (`BridgeMsgpackPayloadCodec`), а не пользовательская кодировка сообщения. Если появляется `B format requires 0 <= number <= 255` или `pymax_tcp_sequence_overflow`, это regression в backend TCP seq guard (`BridgeConnectionManager`).
+8. Если voice распознан, но MAX пока не отдаёт скачиваемый файл, bridge ставит `kind=audio` в `pending_media_downloads`. Ищи `bridge.media_retry.enqueued`, `attempt_started`, `retry_scheduled`, затем `bridge.media_retry.delivered` и `tg.outbound.sent media_type=voice`.
+9. Для protocol-level audio диагностики смотри `max.attachment.audio_protocol_probe`: там есть только candidate, outcome, error code/class и безопасная форма payload (`payload_fields/payload_shape`), без URL/token/text.
+10. Если Telegram пустой, смотри `max.raw.empty_message`, `max.inbound.empty_message`, `max.inbound.empty_recovery` и `max.attachment.voice_reference_missing`. Эти diagnostics не должны содержать URL, token или текст сообщения. Для новых неизвестных форм полезны безопасные поля `element_count`, `element_types`, `element_fields`, `options_fields`.
+
+## Phantom topics `Чат 1779...`
+
+MAX raw payload может содержать `cid` — timestamp-like client id. Он не является `chat_id`; bridge пропускает такие события с `reason=probable_client_cid_chat_id` и не создаёт topic.
+
+One-time cleanup ошибочно созданных topics:
+
+```bash
+python scripts/cleanup_phantom_topics.py
+```
+
+Скрипт выбирает только fallback bindings `Чат 1779...`, у которых тот же `max_msg_id` уже доставлен в настоящий чат, вызывает Telegram `delete_forum_topic`, а если Telegram отказал — `close_forum_topic`. После этого binding получает `mode='disabled'` и title `[deleted phantom] ...`.
+
+### Проверка 2: Telegram -> MAX
+
+1. В том же Telegram topic отправь сообщение, например: `SMOKE TG -> MAX`.
+2. Убедись, что оно появилось в MAX.
+3. Проверь, что в MAX сообщение пришло с префиксом автора Telegram:
+
+```text
+[Имя Фамилия]
+SMOKE TG -> MAX
+```
+
+### Проверка 3: метаданные bridge
+
+Сразу после ручной проверки выполни:
+
+```bash
+cd /opt/maxtg-bridge
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+Ожидаемый результат:
+
+- есть свежая запись `direction='inbound'` для MAX -> Telegram
+- есть свежая запись `direction='outbound'` для Telegram -> MAX
+- нет свежих `failed` записей по тестовому окну
+
+### Когда применять
+
+- после деплоя на новый сервер
+- после изменений в `src/adapters/tg/` или compatibility `src/adapters/tg_adapter.py`
+- после изменений в `src/adapters/max/` или compatibility `src/adapters/max_adapter.py`
+- после изменений в `src/bridge/`
+
+## Добавить новый чат
+
+1. Найти `max_chat_id` из лога: `rg 'event=bridge.inbound.topic_resolved .*outcome=created' data/bridge.log`
+2. Добавить в `config.local.yaml` раздел `chats:` (опционально — если нужен специфичный режим)
+3. При `forward_all: true` чат добавится автоматически при первом сообщении
+
+## Изменить режим чата
+
+**Через DB напрямую:**
+```bash
+.venv/bin/python -c "
+import asyncio, aiosqlite
+
+async def main():
+    db = await aiosqlite.connect('data/bridge.db')
+    await db.execute(\"UPDATE chat_bindings SET mode=? WHERE max_chat_id=?\",
+                     ('readonly', '-70000000000001'))
+    await db.commit()
+    await db.close()
+    print('done')
+
+asyncio.run(main())
+"
+```
+
+Режимы: `active` | `readonly` | `disabled`
+
+## Переименовать топик вручную
+
+Топик переименовывается автоматически когда:
+1. Приходит новое сообщение и текущее название — fallback ("Чат XXXXXX")
+2. Bridge корректно определяет имя из профиля MAX
+
+Если нужно вручную — переименовать прямо в Telegram.
+
+## Проблема: bridge не форвардит сообщения
+
+1. Проверить что bridge запущен: `ps aux | grep 'python -m src.main'`
+2. Проверить лог: `tail -100 data/bridge.log`
+3. Проверить persisted health snapshot: `jq . data/health_state.json`
+4. Проверить outbox алертов: `wc -l data/alert_outbox.jsonl`
+5. Проверить delivery_log в DB (см. выше)
+6. Если `SSL: TLSV1_ALERT_RECORD_OVERFLOW` → убедиться что PyMax 2 создаётся с `ExtraConfig(telemetry=False)`
+7. Если `dialogs=NNN` растёт (>12 при каждом reconnect) → убедиться что `reconnect=False`
+8. Если после reboot VM кажется, что bridge "не поднялся" → проверить `docker compose ps`, Docker healthcheck и startup-лог; в production сначала должны появиться `MAX connected`, потом `Running startup tests`, потом `Startup tests passed: ...`
+
+## Проблема: "❌ Не удалось отправить сообщение в MAX"
+
+Теперь bridge сначала делает до 3 попыток отправки при временных транспортных ошибках MAX:
+
+- `Socket is not connected`
+- `Must be ONLINE session`
+- timeout / broken pipe / connection reset
+
+Если после retry сообщение всё равно не ушло:
+
+- для definite unsent text transport failure в Telegram появится queued notice, а plaintext временно попадёт в `pending_outbound_messages.text` до доставки/TTL 48ч
+- для ambiguous ack timeout или TG→MAX media failure в Telegram появится явная ошибка; медиа не сохраняется для автоповтора
+- в `delivery_log` появится запись `direction='outbound'`, `status='failed'`
+- в `error` будет последняя причина, а в `attempts` — число попыток
+
+Быстрая проверка:
+
+```bash
+sqlite3 -header -column data/bridge.db \
+  "SELECT max_msg_id, error, attempts, datetime(created_at, 'unixepoch', 'localtime') AS created_local \
+   FROM delivery_log \
+   WHERE direction='outbound' AND status='failed' \
+   ORDER BY created_at DESC LIMIT 10"
+```
+
+И в логах:
+
+```bash
+rg 'event=max\.outbound\.(retry|failed|sent)' data/bridge.log
+```
+
+## Проблема: сообщение не появилось (потеряно)
+
+pymax **не воспроизводит историю** после reconnect. Сообщения отправленные во время downtime теряются.
+Это известное ограничение — не баг.
+
+## PyMax 2 live validation и rollback
+
+Эта проверка нужна перед production restart/deploy после изменений в MAX backend,
+DM history sweep, session auth, media download или dependency update.
+
+1. Снять backup state до rollout:
+
+   ```bash
+   cd infra/ansible
+   ansible-playbook backup.yml
+   ```
+
+   Минимум должен быть сохранён MAX session DB из активного `DATA_DIR`.
+
+2. Убедиться, что запущен один bridge instance:
+
+   ```bash
+   docker compose --env-file .env.host -f deploy/docker-compose.prod.yml ps
+   ```
+
+3. После deploy проверить startup path:
+
+   - нет неожиданного SMS-auth flow при существующей session;
+   - в логах есть `MAX connected`;
+   - startup self-tests завершились `Startup tests passed`;
+   - healthcheck и `scripts/smoke_check.py` зелёные.
+
+4. Проверить live traffic:
+
+   - MAX → Telegram: DM text, group text, edit/delete/control event, photo,
+     video, audio/voice;
+   - Telegram → MAX: обычный send, reply и media send;
+   - reconnect создаёт fresh client и возвращает readiness;
+   - серия raw/history/send requests проходит через PyMax 2.1.x 16-bit TCP seq
+     без legacy `pymax_tcp_sequence_overflow`;
+   - DM history sweep пишет `bridge.dm_history_sweep.worker_started` и
+     `bridge.dm_history_sweep.cycle_finished`, не создавая лишнюю MAX API
+     нагрузку в steady phase.
+
+5. Проверить privacy в логах. Не должно быть message text, raw payload, signed
+   CDN URLs, tokens, phones, invite links или proxy credentials.
+
+Known brittle PyMax internals остаются только внутри
+`src/adapters/max/backends/pymax/`: `_app.invoke`, connection/protocol shape,
+Pydantic model validation и transport hooks. Если они ломаются после upstream
+change, first fix должен быть в backend boundary или узком `MaxClientPort`
+extension, без протаскивания PyMax objects в `BridgeCore`.
+
+Rollback path:
+
+1. Остановить rollout / не делать повторный deploy.
+2. Восстановить session DB из backup, если новая версия успела изменить auth
+   state или ушла в reauth loop.
+3. Вернуть код и `maxapi-python` dependency через git rollback к последнему
+   known-good commit.
+4. Запустить `ansible-playbook deploy.yml --check --diff`, затем
+   `ansible-playbook deploy.yml`.
+
+Dependency review: PyMax использует unofficial MAX internal API. При каждом
+обновлении `maxapi-python` сверять release/source diff и повторять checks для
+login sanitizer, legacy session import, raw gateway, msgpack guard, TCP seq
+guard (сейчас 16-bit seq в PyMax 2.1.x), MAX-only egress transport и media URL
+handling.
+
+## Обновление зависимостей
+
+```bash
+source .venv/bin/activate
+pip install --upgrade maxapi-python aiogram aiosqlite
+# Проверить что всё работает
+python -m src.main
+```
+
+## Очистка старых данных вручную
+
+```bash
+.venv/bin/python -c "
+import asyncio, aiosqlite, time
+
+async def main():
+    db = await aiosqlite.connect('data/bridge.db')
+    cutoff = int(time.time()) - 30 * 86400
+    await db.execute('DELETE FROM message_map WHERE created_at < ?', (cutoff,))
+    await db.execute('DELETE FROM delivery_log WHERE created_at < ?', (cutoff,))
+    await db.commit()
+    await db.close()
+    print('cleanup done')
+
+asyncio.run(main())
+"
+```
+
+Автоочистка запускается каждые 30 минут автоматически.

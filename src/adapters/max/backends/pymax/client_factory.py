@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+from pymax import ExtraConfig, SyncOverrides
+from pymax.api.session.enums import DeviceType
+from pymax.api.session.payloads import MobileUserAgentPayload
+from pymax.auth import AuthFlow
+from pymax.versions.catalog import VersionCatalog
+
+from ...network import MaxEgressProfile
+from .session_store import BridgeSessionStore
+from .transport import BridgeClient, EgressClient
+
+
+def legacy_desktop_user_agent() -> MobileUserAgentPayload:
+    """Keep the legacy desktop shape on a version MAX still accepts."""
+    catalog = VersionCatalog()
+    app_version = catalog.recommended()
+    build_number = catalog.resolve(app_version).build_number
+    return MobileUserAgentPayload(
+        device_type=DeviceType.DESKTOP,
+        app_version=app_version,
+        os_version="Windows 10",
+        timezone="Europe/Moscow",
+        screen="1080x1920 1.0x",
+        locale="ru",
+        device_name="Chrome",
+        device_locale="ru",
+        build_number=build_number,
+        header_user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+    )
+
+
+def legacy_sync_overrides() -> SyncOverrides:
+    return SyncOverrides(
+        chats_sync=0,
+        contacts_sync=0,
+        drafts_sync=0,
+        presence_sync=0,
+    )
+
+
+def make_extra_config(*, store=None) -> ExtraConfig:
+    return ExtraConfig(
+        reconnect=False,
+        relogin=False,
+        telemetry=False,
+        store=store,
+        user_agent=legacy_desktop_user_agent(),
+        sync=legacy_sync_overrides(),
+    )
+
+
+def create_pymax_client(
+    *,
+    phone: str,
+    data_dir: str,
+    session_name: str,
+    egress: MaxEgressProfile | None = None,
+    extra_config: ExtraConfig | None = None,
+    auth_flow: AuthFlow | None = None,
+    import_legacy_session: bool = True,
+):
+    session_store = BridgeSessionStore(
+        data_dir,
+        session_name,
+        phone=phone,
+        import_legacy=import_legacy_session,
+    )
+    if extra_config is None:
+        extra_config = make_extra_config(store=session_store)
+    elif extra_config.store is None:
+        extra_config = extra_config.model_copy(update={"store": session_store})
+    kwargs = {
+        "phone": phone,
+        "work_dir": data_dir,
+        "session_name": session_name,
+        "extra_config": extra_config,
+    }
+    if auth_flow is not None:
+        kwargs["auth_flow"] = auth_flow
+    if egress is None:
+        return BridgeClient(**kwargs)
+    return EgressClient(**kwargs, socket_connector=egress.socket_connector)

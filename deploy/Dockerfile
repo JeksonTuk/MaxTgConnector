@@ -1,0 +1,39 @@
+# pymax warns that Python 3.12 socket connections may be unstable in production.
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Непривилегированный пользователь для рантайма контейнера
+RUN groupadd --system --gid 10001 app && \
+    useradd --system --uid 10001 --gid app --create-home --home-dir /home/app app
+
+# Зависимости отдельным слоем — кешируются при неизменном requirements*.txt
+COPY requirements.txt requirements-dev.txt ./
+RUN pip install --no-cache-dir -r requirements-dev.txt
+
+# Исходники
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY tests/ ./tests/
+COPY docs/ ./docs/
+COPY deploy/ ./deploy/
+COPY infra/ansible/group_vars/all.yml ./infra/ansible/group_vars/all.yml
+COPY pytest.ini .
+COPY config.yaml .
+COPY spike/ ./spike/
+
+# data/ монтируется как volume снаружи (docker-compose или Fly.io persistent volume)
+# Создаём директорию на случай если volume не примонтирован
+RUN mkdir -p /app/data/tmp /tmp/bridge-tmp && \
+    chown -R app:app /app /tmp/bridge-tmp
+
+ENV DATA_DIR=/app/data
+ENV PYTHONUNBUFFERED=1
+ENV TMPDIR=/tmp/bridge-tmp
+
+USER app
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD python -m src.runtime.healthcheck
+
+CMD ["python", "-m", "src.main"]

@@ -1,0 +1,313 @@
+"""
+SQLite схема для bridge state.
+Всё состояние — только здесь. Никаких in-memory кешей критических данных.
+"""
+
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+PRAGMA foreign_keys=ON;
+
+-- Связь: MAX чат ↔ Telegram топик
+CREATE TABLE IF NOT EXISTS chat_bindings (
+    max_chat_id     TEXT PRIMARY KEY,
+    tg_topic_id     INTEGER NOT NULL,
+    title           TEXT NOT NULL,
+    mode            TEXT NOT NULL DEFAULT 'active',  -- active | readonly | disabled
+    created_at      INTEGER NOT NULL  -- unix timestamp
+);
+
+-- Связь: MAX message_id ↔ Telegram message_id (дедупликация + reply routing)
+CREATE TABLE IF NOT EXISTS message_map (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_msg_id      TEXT NOT NULL,
+    max_chat_id     TEXT NOT NULL,
+    tg_msg_id       INTEGER,
+    tg_topic_id     INTEGER,
+    direction       TEXT NOT NULL,   -- inbound | outbound
+    created_at      INTEGER NOT NULL,
+    UNIQUE(max_msg_id, max_chat_id)
+);
+
+-- Лог доставки (только meta, без текста сообщений)
+CREATE TABLE IF NOT EXISTS delivery_log (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_msg_id      TEXT NOT NULL,
+    max_chat_id     TEXT NOT NULL,
+    direction       TEXT NOT NULL,
+    status          TEXT NOT NULL,   -- pending | delivered | partial | failed
+    error           TEXT,
+    attempts        INTEGER NOT NULL DEFAULT 1,
+    created_at      INTEGER NOT NULL,
+    last_attempt_at INTEGER NOT NULL
+);
+
+-- Дополнительные TG message_id, которые отвечают исходному MAX message_id.
+-- Нужны для медиа, досланных позже отдельным сообщением.
+CREATE TABLE IF NOT EXISTS tg_reply_map (
+    tg_msg_id       INTEGER PRIMARY KEY,
+    max_chat_id     TEXT NOT NULL,
+    max_msg_id      TEXT NOT NULL,
+    tg_topic_id     INTEGER,
+    source          TEXT NOT NULL,
+    created_at      INTEGER NOT NULL
+);
+
+-- Доставленные MAX media parts.
+-- Только meta для идемпотентности edit/late recovery; без текста, signed URL, token или raw payload.
+CREATE TABLE IF NOT EXISTS delivered_media_parts (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_chat_id      TEXT NOT NULL,
+    base_max_msg_id  TEXT NOT NULL,
+    attachment_index INTEGER NOT NULL,
+    kind             TEXT NOT NULL,
+    tg_msg_id        INTEGER NOT NULL,
+    tg_topic_id      INTEGER,
+    source           TEXT NOT NULL,
+    media_chat_id    TEXT,
+    media_msg_id     TEXT,
+    reference_kind   TEXT,
+    reference_id     TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    UNIQUE(max_chat_id, base_max_msg_id, attachment_index, kind)
+);
+
+-- Durable retry для MAX-медиа, которое не удалось скачать сразу.
+-- Хранится только meta: без текста сообщений, signed URL, token или raw payload.
+CREATE TABLE IF NOT EXISTS pending_media_downloads (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_chat_id      TEXT NOT NULL,
+    max_msg_id       TEXT NOT NULL,
+    tg_topic_id      INTEGER NOT NULL,
+    attachment_index INTEGER NOT NULL,
+    kind             TEXT NOT NULL,
+    source_type      TEXT,
+    media_chat_id    TEXT NOT NULL,
+    media_msg_id     TEXT NOT NULL,
+    reference_kind   TEXT NOT NULL,
+    reference_id     TEXT NOT NULL,
+    filename         TEXT,
+    duration         INTEGER,
+    width            INTEGER,
+    height           INTEGER,
+    status           TEXT NOT NULL DEFAULT 'pending',
+    attempts         INTEGER NOT NULL DEFAULT 0,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL,
+    next_attempt_at  INTEGER NOT NULL,
+    last_attempt_at  INTEGER,
+    lease_until      INTEGER,
+    last_error       TEXT,
+    delivered_tg_msg_id INTEGER,
+    delivered_at     INTEGER,
+    UNIQUE(max_chat_id, max_msg_id, attachment_index, kind)
+);
+
+-- Временный recovery cache для проблемных MAX media.
+-- Stable refs лежат открыто как meta; volatile media hints шифруются и чистятся по TTL.
+CREATE TABLE IF NOT EXISTS media_recovery_cache (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_chat_id        TEXT NOT NULL,
+    max_msg_id         TEXT NOT NULL,
+    attachment_index   INTEGER NOT NULL,
+    kind               TEXT NOT NULL,
+    source_type        TEXT,
+    media_chat_id      TEXT,
+    media_msg_id       TEXT,
+    reference_kind     TEXT,
+    reference_id       TEXT,
+    filename           TEXT,
+    duration           INTEGER,
+    width              INTEGER,
+    height             INTEGER,
+    payload_cipher     TEXT,
+    payload_ciphertext TEXT,
+    created_at         INTEGER NOT NULL,
+    updated_at         INTEGER NOT NULL,
+    expires_at         INTEGER NOT NULL,
+    UNIQUE(max_chat_id, max_msg_id, attachment_index, kind)
+);
+
+-- Durable retry для Telegram -> MAX текстов.
+-- Хранит plaintext только для сообщений, которые не удалось отправить сразу.
+CREATE TABLE IF NOT EXISTS pending_outbound_messages (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_topic_id          INTEGER NOT NULL,
+    tg_msg_id            INTEGER NOT NULL,
+    max_chat_id          TEXT NOT NULL,
+    reply_to_max_id      TEXT,
+    text                 TEXT,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at      INTEGER NOT NULL,
+    last_error           TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    last_attempt_at      INTEGER,
+    lease_until          INTEGER,
+    delivered_max_msg_id TEXT,
+    delivered_at         INTEGER,
+    UNIQUE(tg_topic_id, tg_msg_id)
+);
+
+-- Состояние reaction обновляется отдельно: failure reaction не повторяет MAX send.
+CREATE TABLE IF NOT EXISTS pending_outbound_reactions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tg_topic_id     INTEGER NOT NULL,
+    tg_msg_id       INTEGER NOT NULL,
+    reaction        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending', -- pending | retry | delivered
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at INTEGER NOT NULL,
+    last_error      TEXT,
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    UNIQUE(tg_topic_id, tg_msg_id)
+);
+
+-- Durable retry для MAX -> Telegram текстов.
+-- Хранит plaintext только для сообщений, которые не удалось отправить сразу.
+CREATE TABLE IF NOT EXISTS pending_inbound_messages (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_chat_id          TEXT NOT NULL,
+    max_msg_id           TEXT NOT NULL,
+    tg_topic_id          INTEGER NOT NULL,
+    text                 TEXT,
+    status               TEXT NOT NULL DEFAULT 'pending',
+    attempts             INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at      INTEGER NOT NULL,
+    last_error           TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    last_attempt_at      INTEGER,
+    lease_until          INTEGER,
+    delivered_tg_msg_id  INTEGER,
+    delivered_at         INTEGER,
+    UNIQUE(max_chat_id, max_msg_id)
+);
+
+-- Известные пользователи MAX (name ↔ user_id, для /dm поиска)
+CREATE TABLE IF NOT EXISTS known_users (
+    max_user_id  TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    updated_at   INTEGER NOT NULL
+);
+
+-- Durable Telegram callback actions.
+-- Хранит только callback payload для MAX invite join; внешние URL не пишутся в SQLite.
+CREATE TABLE IF NOT EXISTS telegram_callback_actions (
+    id              TEXT PRIMARY KEY,
+    action_type     TEXT NOT NULL,
+    max_chat_id     TEXT NOT NULL,
+    max_msg_id      TEXT NOT NULL,
+    tg_topic_id     INTEGER,
+    tg_msg_id       INTEGER,
+    source_type     TEXT,
+    payload_json    TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    created_at      INTEGER NOT NULL,
+    used_at         INTEGER,
+    last_error      TEXT
+);
+
+-- Поколения MAX-аккаунтов. Новый телефон = новый MAX account.
+CREATE TABLE IF NOT EXISTS max_account_generations (
+    generation_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    max_user_id              TEXT NOT NULL UNIQUE,
+    masked_phone             TEXT,
+    session_fingerprint_hash TEXT,
+    status                   TEXT NOT NULL DEFAULT 'active', -- active | retired | lost
+    first_seen_at            INTEGER NOT NULL,
+    last_seen_at             INTEGER NOT NULL
+);
+
+-- Recovery registry для переноса Telegram topics на новый MAX-аккаунт.
+-- Хранит только операционные метаданные доступа; текст сообщений не хранится.
+CREATE TABLE IF NOT EXISTS chat_recovery_registry (
+    registry_key        TEXT PRIMARY KEY, -- tg_topic:<id> | max_chat:<id>
+    tg_topic_id         INTEGER UNIQUE,
+    title               TEXT NOT NULL,
+    old_max_chat_id     TEXT,
+    current_max_chat_id TEXT,
+    chat_kind           TEXT NOT NULL DEFAULT 'unknown', -- dm | group | channel | unknown
+    mode                TEXT NOT NULL DEFAULT 'active',
+    priority            INTEGER NOT NULL DEFAULT 0,
+    access_type         TEXT,
+    invite_link         TEXT,
+    owner_user_id       TEXT,
+    owner_name          TEXT,
+    admin_contacts_json TEXT NOT NULL DEFAULT '[]',
+    dm_partner_user_id  TEXT,
+    dm_partner_name     TEXT,
+    participant_count   INTEGER,
+    manual_note         TEXT,
+    recovery_status     TEXT NOT NULL DEFAULT 'tracked',
+    first_seen_at       INTEGER NOT NULL,
+    last_seen_at        INTEGER NOT NULL,
+    last_scan_at        INTEGER
+);
+
+-- DM-only contact recovery registry.
+-- Source of truth: real MAX dialogs and already bound DM topics, not full address book.
+CREATE TABLE IF NOT EXISTS dm_contact_recovery_registry (
+    max_user_id        TEXT PRIMARY KEY,
+    display_name       TEXT NOT NULL,
+    old_dm_chat_id     TEXT,
+    current_dm_chat_id TEXT,
+    tg_topic_id        INTEGER,
+    source             TEXT NOT NULL DEFAULT 'dialog',
+    recovery_status    TEXT NOT NULL DEFAULT 'visible',
+    first_seen_at      INTEGER NOT NULL,
+    last_seen_at       INTEGER NOT NULL,
+    last_scan_at       INTEGER
+);
+
+-- Append-only audit по recovery registry; без текста сообщений и raw payload.
+CREATE TABLE IF NOT EXISTS chat_recovery_events (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    registry_key  TEXT,
+    tg_topic_id   INTEGER,
+    event_type    TEXT NOT NULL,
+    details_json  TEXT NOT NULL DEFAULT '{}',
+    created_at    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_known_users_name ON known_users(display_name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_message_map_max ON message_map(max_msg_id, max_chat_id);
+CREATE INDEX IF NOT EXISTS idx_message_map_tg  ON message_map(tg_msg_id);
+CREATE INDEX IF NOT EXISTS idx_tg_reply_map_tg ON tg_reply_map(tg_msg_id);
+CREATE INDEX IF NOT EXISTS idx_delivered_media_base
+  ON delivered_media_parts(max_chat_id, base_max_msg_id);
+CREATE INDEX IF NOT EXISTS idx_delivered_media_reference
+  ON delivered_media_parts(max_chat_id, base_max_msg_id, kind, reference_kind, reference_id);
+CREATE INDEX IF NOT EXISTS idx_delivery_status ON delivery_log(status, last_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_created ON delivery_log(created_at);
+CREATE INDEX IF NOT EXISTS idx_message_created  ON message_map(created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_media_status_due
+  ON pending_media_downloads(status, next_attempt_at, lease_until);
+CREATE INDEX IF NOT EXISTS idx_pending_media_source
+  ON pending_media_downloads(max_chat_id, max_msg_id);
+CREATE INDEX IF NOT EXISTS idx_media_recovery_cache_expires
+  ON media_recovery_cache(expires_at);
+CREATE INDEX IF NOT EXISTS idx_media_recovery_cache_source
+  ON media_recovery_cache(media_chat_id, media_msg_id, reference_kind, reference_id);
+CREATE INDEX IF NOT EXISTS idx_pending_outbound_status_due
+  ON pending_outbound_messages(status, next_attempt_at, lease_until);
+CREATE INDEX IF NOT EXISTS idx_pending_outbound_created
+  ON pending_outbound_messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_pending_outbound_reactions_status_due
+  ON pending_outbound_reactions(status, next_attempt_at);
+CREATE INDEX IF NOT EXISTS idx_pending_inbound_status_due
+  ON pending_inbound_messages(status, next_attempt_at, lease_until);
+CREATE INDEX IF NOT EXISTS idx_pending_inbound_created
+  ON pending_inbound_messages(created_at);
+CREATE INDEX IF NOT EXISTS idx_tg_callback_actions_status
+  ON telegram_callback_actions(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_tg_callback_actions_source
+  ON telegram_callback_actions(max_chat_id, max_msg_id);
+CREATE INDEX IF NOT EXISTS idx_chat_recovery_status ON chat_recovery_registry(recovery_status);
+CREATE INDEX IF NOT EXISTS idx_chat_recovery_current ON chat_recovery_registry(current_max_chat_id);
+CREATE INDEX IF NOT EXISTS idx_chat_recovery_events_topic ON chat_recovery_events(tg_topic_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_dm_contact_recovery_topic ON dm_contact_recovery_registry(tg_topic_id);
+CREATE INDEX IF NOT EXISTS idx_dm_contact_recovery_status ON dm_contact_recovery_registry(recovery_status);
+"""

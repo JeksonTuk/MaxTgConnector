@@ -1,0 +1,378 @@
+# Runbook: Hetzner Production
+
+> **С версии 1.1.7 рекомендуемый способ — [Ansible](../../infra/ansible/README.md).**
+> Для регулярного апдейта используй `ansible-playbook deploy.yml`.
+> Для бэкапа — `backup.yml`. Для нового VM — `bootstrap.yml` + `hardening.yml`.
+> Ручные шаги ниже остаются источником правды для того, что Ansible намеренно
+> не автоматизирует (создание VM в панели, копирование секретов, SMS reauth)
+> и как fallback, если ansible недоступен.
+> `ansible-playbook deploy.yml --check --diff` здесь означает preflight verify без rollout, а не полную симуляцию `docker compose build/up`.
+> Любой rollout, включая аварийный, должен собираться только из уже отправленного
+> immutable Git commit; приватные env/state-файлы не являются частью release.
+
+## Цель
+
+Безопасный production-деплой bridge на Hetzner Cloud:
+
+- один VM
+- Docker Compose
+- без публичных HTTP-портов
+- SSH только по ключу и только с доверенного IP
+- `UFW` + `fail2ban` + `unattended-upgrades`
+- секреты и state только на сервере
+
+Полный inventory окружения для схемы MAX через РФ WAN:
+[../environment-inventory.md](../environment-inventory.md).
+
+## Рекомендованный сервер
+
+- Серия: `CX23`
+- Регион: `hel1`
+- ОС: `Ubuntu 24.04`
+- Сеть: `Primary IPv4 + IPv6`
+- Hetzner Backups: `on`
+
+Ориентир по стоимости на 2026-04-02:
+
+- `CX23`: `EUR 3.99 / month`
+- `Primary IPv4`: `EUR 0.50 / month`
+- `Backups`: `EUR 0.80 / month`
+- Итого: `EUR 5.29 / month` без VAT
+- При `19% VAT`: около `EUR 6.30 / month`
+
+## Что подготовить локально
+
+Нужно иметь локально:
+
+- `.env.secrets`
+- `.env`
+- `config.local.yaml`
+- `data/session.db*`
+- `data/bridge.db`
+- `data/recovery_contacts.enc.json`, если создан encrypted contacts snapshot для переноса на новый номер
+
+Сделай бэкап:
+
+```bash
+tar -czf maxtg-bridge-backup.tgz .env .env.secrets config.local.yaml data/
+```
+
+## 1. Создать сервер в Hetzner
+
+При создании:
+
+- добавить SSH key
+- включить Backups
+- выбрать `hel1`
+- создать Cloud Firewall
+
+Firewall bootstrap:
+
+- inbound `22/tcp` только с твоего IP, если IP стабильный
+- если IP нестабильный, через Console добавить только текущий временный `/32`,
+  подтвердить доступ и затем убрать его, когда он больше не нужен
+- других inbound-правил не добавлять
+
+## 2. Базовый hardening
+
+Под root:
+
+```bash
+adduser deploy
+usermod -aG sudo deploy
+rsync --archive --chown=deploy:deploy ~/.ssh /home/deploy
+```
+
+В `/etc/ssh/sshd_config`:
+
+```text
+PermitRootLogin no
+PasswordAuthentication no
+PubkeyAuthentication yes
+KbdInteractiveAuthentication no
+ChallengeResponseAuthentication no
+UsePAM yes
+X11Forwarding no
+```
+
+Потом:
+
+```bash
+systemctl restart ssh
+```
+
+Установить обновления и базовые пакеты:
+
+```bash
+apt update && apt upgrade -y
+apt install -y unattended-upgrades ca-certificates curl git ufw
+dpkg-reconfigure -plow unattended-upgrades
+```
+
+## 3. Установить Docker
+
+```bash
+apt install -y ca-certificates curl
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+apt update
+apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+usermod -aG docker deploy
+```
+
+Перелогиниться.
+
+## 4. Защитить SSH и сетевой доступ
+
+```bash
+apt install -y ufw fail2ban
+```
+
+Минимальный baseline:
+
+- в `sshd`:
+  - `PermitRootLogin no`
+  - `PasswordAuthentication no`
+  - `AllowUsers deploy`
+- в `UFW`:
+  - `default deny incoming`
+  - `default allow outgoing`
+  - `allow 22/tcp` только с домашнего IP
+- в `fail2ban`:
+  - включить jail `sshd`
+  - добавить свой текущий IP в `ignoreip`
+
+Cloud Firewall в панели Hetzner:
+
+- не должно быть широких правил `Any IPv4` / `Any IPv6`
+- должно быть только `22/tcp` с твоего IP в формате `x.x.x.x/32`
+
+Важно: если домашний IP изменится, правило нужно обновить и в Hetzner Cloud Firewall, и в `UFW` на самом сервере.
+
+## 5. Развернуть bridge
+
+```bash
+sudo mkdir -p /opt/maxtg-bridge
+sudo chown deploy:deploy /opt/maxtg-bridge
+cd /opt/maxtg-bridge
+git clone <YOUR_GIT_REMOTE> .
+cp deploy/hetzner.env.example .env.host
+mkdir -p data
+chmod 700 data
+```
+
+Скопировать на сервер:
+
+- `.env.secrets`
+- `.env`
+- `config.local.yaml`
+- содержимое `data/`
+
+Для production MAX через домашний РФ egress в `.env.secrets` также должен быть `MAX_EGRESS_PROXY_URL`. Для reverse Channel M в `.env.host` должны быть `MAX_EGRESS_PROXY_HOST` и `MAX_EGRESS_PROXY_GATEWAY`, чтобы Docker Compose направлял proxy host на VPS docker bridge listener. В `config.local.yaml`:
+
+Для encrypted contacts snapshot в `.env.secrets` должен быть `MAX_RECOVERY_CONTACTS_KEY`. Без этого ключа `data/recovery_contacts.enc.json` нельзя расшифровать после переноса на новый номер.
+
+```yaml
+max:
+  egress:
+    active: "home_ru_proxy"
+```
+
+В базовом `config.yaml` `health.max_egress_startup_grace_seconds` задаёт окно
+после reboot VPS, когда bridge ждёт повторного подключения домашнего reverse
+Channel M без owner alert. Значение по умолчанию `900` секунд покрывает холодный
+старт роутерного tunnel; после этого окна `home_ru_proxy` снова считается
+обычной аварией `max_egress_unavailable`.
+
+Рекомендуемый способ применить эти значения после генерации artifact в
+`router_configuration`:
+
+```bash
+cd infra/ansible
+ansible-playbook channel-m-reverse.yml
+```
+
+Права:
+
+```bash
+chmod 600 .env .env.secrets config.local.yaml .env.host
+chmod 700 data
+```
+
+Выставить UID/GID:
+
+```bash
+echo "APP_UID=$(id -u)" > .env.host
+echo "APP_GID=$(id -g)" >> .env.host
+```
+
+Первый запуск:
+
+```bash
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml build
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml up -d
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs -f
+```
+
+## 6. Миграция MAX-сессии
+
+Ожидаемый путь:
+
+- bridge стартует
+- использует перенесённую сессию
+- подключается к MAX без re-auth
+
+Если MAX требует re-auth:
+
+```bash
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml down
+docker run --rm -it \
+  --env-file .env \
+  --env-file .env.secrets \
+  -e CONFIG_PATH=/app/config.yaml \
+  -e CONFIG_LOCAL_PATH=/app/config.local.yaml \
+  -e DATA_DIR=/app/data \
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/config.yaml:/app/config.yaml:ro" \
+  -v "$(pwd)/config.local.yaml:/app/config.local.yaml:ro" \
+  maxtg-bridge:prod \
+  python -m src.main
+```
+
+## 7. Проверка после деплоя
+
+Проверить:
+
+- `docker ps`
+- `sudo ufw status numbered`
+- `sudo fail2ban-client status sshd`
+- `docker ps`
+- `docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=100`
+- startup-лог содержит `MAX connected`, затем `Running startup tests`, затем `Startup tests passed: ...`
+- `/status` показывает `MAX egress: home_ru_proxy`; `hetzner_direct` допустим только как ручной аварийный режим и должен давать warning
+- входящее MAX -> Telegram
+- reply Telegram -> MAX
+- медиа MAX -> Telegram
+- reboot VM -> контейнер поднялся сам
+
+Быстрый smoke-report:
+
+```bash
+cd /opt/maxtg-bridge
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+## 8. Обновления
+
+> **Рекомендованный путь — Ansible:** `cd infra/ansible && ansible-playbook deploy.yml --check --diff && ansible-playbook deploy.yml`.
+> Следующий путь — контролируемый fallback, когда сам transport Ansible
+> недоступен. Это не второй обычный способ deploy.
+
+### Контролируемый fallback без Ansible
+
+Использовать только при проблеме с control channel/маршрутизацией до уже
+работающего сервера. Он сохраняет те же границы, что Ansible:
+
+1. Зафиксировать `immutable_commit` уже после `git push` и записать текущий
+   commit на сервере для rollback. Не деплоить рабочее дерево, branch tip или
+   непроверенный архив.
+2. До изменения создать production backup. State, `data/`, `.env*`,
+   `config.local.yaml`, SSH-материалы и recovery snapshot остаются только на
+   сервере и не входят в release bundle.
+3. Если мешает VPN/маршрут администратора, временно использовать стабильный
+   разрешённый путь. Через Hetzner Console разрешить **только** текущий `/32` в
+   Cloud Firewall и такой же `/32` в UFW; существующий доверенный `/32` не
+   удалять до подтверждения нового доступа. Никогда не открывать SSH для
+   `0.0.0.0/0` или всего IPv6-интернета. После работы вернуть обычный маршрут.
+4. Если Git remote на сервере доступен, переключить release на точный
+   `immutable_commit`; если нет — подготовить bundle исключительно через
+   `git archive` этого commit и перенести только tracked release-файлы.
+   Не передавать dot-env, данные, локальные конфиги, ключи или untracked files.
+5. На сервере выполнить тот же build/up, что использует role `bridge_app`, без
+   `compose down`; затем проверить Docker health, startup self-tests и
+   `scripts/smoke_check.py`. Для media-change дополнительно проверить один
+   MAX→Telegram media delivery и отсутствие duplicate.
+6. При неуспешном health/smoke немедленно вернуть предыдущий immutable commit
+   и повторить build/up. Backup использовать только для восстановления
+   повреждённого state, а не как замену rollback кода.
+
+Минимальный server-side rollout после шагов 1–4 (значения остаются в private
+operator notes, а не в этом публичном репозитории):
+
+```bash
+cd /opt/maxtg-bridge
+git fetch origin
+git checkout --detach <IMMUTABLE_PUSHED_COMMIT>
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml build
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml up -d
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=50
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+Не использовать здесь `git pull`: он не гарантирует точный проверенный commit.
+
+## 9. Если домашний IP сменился
+
+1. Открыть Hetzner Cloud Firewall в панели.
+2. Добавить новый source-IP для `22/tcp` как `x.x.x.x/32`, не удаляя старый до
+   проверки нового подключения.
+3. Если доступ на сервер потерян, зайти через Hetzner Console / LISH.
+4. На сервере добавить такое же правило `UFW`, подтвердить SSH с нового IP и
+   только после этого при необходимости удалить устаревшее правило:
+
+```bash
+sudo ufw delete allow from <OLD_IP> to any port 22 proto tcp
+sudo ufw allow from <NEW_IP> to any port 22 proto tcp comment 'SSH from home IP'
+sudo ufw status numbered
+```
+
+## 10. Recovery
+
+Минимум для восстановления:
+
+- `.env.secrets`
+- `.env`
+- `config.local.yaml`
+- `data/session.db*`
+- `data/bridge.db`
+- `data/recovery_contacts.enc.json` вместе с `MAX_RECOVERY_CONTACTS_KEY`, если используется `/recovery contacts snapshot`
+
+При компрометации:
+
+1. удалить VM
+2. поднять новую
+3. восстановить файлы
+4. поднять контейнер заново
+
+## 11. Операционный чеклист
+
+Как заходить на сервер:
+
+```bash
+ssh -i ~/.ssh/id_rsa deploy@<SERVER_IP>
+```
+
+Как проверить, что bridge жив:
+
+```bash
+cd /opt/maxtg-bridge
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml ps
+docker compose --env-file .env.host -f deploy/docker-compose.prod.yml logs --tail=100 --since=10m
+python3 scripts/smoke_check.py --db data/bridge.db --minutes 15
+```
+
+Как обновлять bridge:
+
+```bash
+cd infra/ansible
+ansible-playbook deploy.yml --check --diff
+ansible-playbook deploy.yml
+```
+
+Если Ansible transport временно недоступен, использовать только
+[контролируемый fallback](#контролируемый-fallback-без-ansible) выше.

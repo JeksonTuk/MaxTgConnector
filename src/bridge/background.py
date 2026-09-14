@@ -1,0 +1,725 @@
+"""Bridge background loops."""
+
+import asyncio
+import inspect
+import json
+import logging
+import os
+import random
+import time
+from collections.abc import Awaitable, Callable
+from pathlib import Path
+from typing import Optional
+
+from .contracts import (
+    MAX_DM_SWEEP_BACKFILL_SECONDS,
+    MaxBridgePort,
+    TelegramBridgePort,
+    is_probable_client_cid,
+)
+from ..config.loader import AppConfig
+from ..db.repository import Repository
+from ..logging_utils import build_max_flow_id, log_event
+from ..runtime.health import RuntimeHealthStore, Severity
+
+logger = logging.getLogger("src.bridge.core")
+
+
+def _default_restart_process(reason: str) -> None:
+    log_event(
+        logger,
+        logging.CRITICAL,
+        "bridge.watchdog.process_exit",
+        stage="watchdog",
+        outcome="exiting",
+        reason=reason,
+    )
+    os._exit(75)
+
+
+def _egress_is_home_ru_proxy(max_adapter: MaxBridgePort) -> bool:
+    status = max_adapter.get_egress_status()
+    return bool(status and status.get("max_egress_active") == "home_ru_proxy")
+
+
+def _probe_summary(probe: dict[str, object] | None) -> str:
+    if not probe:
+        return "probe result missing"
+    stage = str(probe.get("stage") or "unknown")
+    error = str(probe.get("error") or "").strip()
+    if error:
+        return f"{stage}: {error}"
+    return stage
+
+
+def _load_last_self_heal_restart(path: Path | None) -> int | None:
+    if path is None or not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    value = data.get("last_restart_at")
+    return int(value) if isinstance(value, int) else None
+
+
+def _persist_self_heal_restart(path: Path | None, *, reason: str, probe: dict[str, object] | None) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "last_restart_at": int(time.time()),
+        "reason": reason,
+        "probe_stage": (probe or {}).get("stage"),
+        "probe_ok": bool((probe or {}).get("ok")),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+
+
+def _self_heal_restart_allowed(
+    path: Path | None,
+    *,
+    cooldown_seconds: int,
+    now: int | None = None,
+) -> bool:
+    last_restart_at = _load_last_self_heal_restart(path)
+    if last_restart_at is None:
+        return True
+    return (now or int(time.time())) - last_restart_at >= cooldown_seconds
+
+
+async def run_periodic_status(
+    *,
+    health: Optional[RuntimeHealthStore],
+    build_status_message: Callable[[int], Awaitable[str]],
+    send_ops_notification: Callable[[str], Awaitable[None]],
+    interval_hours: int = 4,
+):
+    await asyncio.sleep(interval_hours * 3600)
+    while True:
+        try:
+            text = await build_status_message(interval_hours)
+            await send_ops_notification(text)
+            if health is not None:
+                await health.mark_healthy(
+                    "scheduler",
+                    summary="Планировщик периодических статус-отчётов работает",
+                    notify=False,
+                )
+            logger.info("Periodic status sent")
+        except Exception as e:
+            logger.error("Periodic status error: %s", e)
+            if health is not None:
+                await health.report_issue(
+                    "scheduler",
+                    code="periodic_status_failed",
+                    summary="Периодический 4h status не смог отправиться",
+                    raw_cause=str(e),
+                    severity=Severity.ERROR,
+                    impact="Оператор может не получить очередной health reminder вовремя.",
+                    operator_hint="Проверь Telegram notifier и состояние scheduler task.",
+                    auto_recovery="Следующая попытка будет на следующем цикле scheduler.",
+                    notify=False,
+                )
+        await asyncio.sleep(interval_hours * 3600)
+
+
+async def run_max_watchdog(
+    *,
+    max_adapter: MaxBridgePort,
+    health: Optional[RuntimeHealthStore],
+    send_ops_notification: Callable[[str], Awaitable[None]],
+    emit_health_alert: Callable[[object], Awaitable[None]],
+    alert_after_seconds: int = 60,
+    check_interval: int = 10,
+    egress_probe_interval: int = 30,
+    egress_startup_grace_seconds: int = 15 * 60,
+    self_heal_grace_seconds: int = 180,
+    self_heal_restart_cooldown_seconds: int = 1800,
+    self_heal_state_path: Path | None = None,
+    restart_process: Callable[[str], None] | None = None,
+):
+    disconnected_since: Optional[float] = None
+    alert_sent = False
+    self_heal_pending_reported = False
+    last_egress_probe_at = 0.0
+    restart = restart_process or _default_restart_process
+
+    while True:
+        await asyncio.sleep(check_interval)
+
+        if max_adapter.is_ready():
+            if alert_sent and health is None and disconnected_since is not None:
+                downtime = int(time.time() - disconnected_since)
+                await send_ops_notification(
+                    f"⚠️ Возможен пропуск сообщений MAX за время простоя (~{downtime}с): "
+                    "история во время disconnect не воспроизводится автоматически"
+                )
+                await send_ops_notification(
+                    f"✅ MAX восстановлен (простой ~{downtime}с)"
+                )
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "bridge.watchdog.max_recovered",
+                    stage="watchdog",
+                    outcome="recovered",
+                    downtime_seconds=downtime,
+                )
+            disconnected_since = None
+            alert_sent = False
+            self_heal_pending_reported = False
+            last_egress_probe_at = 0.0
+        else:
+            if disconnected_since is None:
+                disconnected_since = time.time()
+                log_event(
+                    logger,
+                    logging.WARNING,
+                    "bridge.watchdog.max_lost",
+                    stage="watchdog",
+                    outcome="started",
+                )
+
+            elapsed = time.time() - disconnected_since
+            home_proxy_active = _egress_is_home_ru_proxy(max_adapter)
+            latest_probe: dict[str, object] | None = None
+            home_proxy_startup_grace = False
+            if home_proxy_active and (
+                time.monotonic() - last_egress_probe_at >= max(0, egress_probe_interval)
+            ):
+                last_egress_probe_at = time.monotonic()
+                try:
+                    latest_probe = await max_adapter.probe_egress()
+                except Exception as exc:
+                    latest_probe = {
+                        "ok": False,
+                        "stage": "probe_call",
+                        "error": str(exc).strip() or exc.__class__.__name__,
+                    }
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "bridge.watchdog.max_egress_probe_failed",
+                        stage="watchdog",
+                        outcome="failed",
+                        error=latest_probe["error"],
+                    )
+
+                home_proxy_startup_grace = (
+                    latest_probe is not None
+                    and not latest_probe.get("ok")
+                    and elapsed < egress_startup_grace_seconds
+                )
+                if (
+                    latest_probe is not None
+                    and not latest_probe.get("ok")
+                    and health is not None
+                    and not home_proxy_startup_grace
+                ):
+                    await health.report_issue(
+                        "max_link",
+                        code="max_egress_unavailable",
+                        summary=f"MAX egress home_ru_proxy недоступен: {_probe_summary(latest_probe)}",
+                        raw_cause=_probe_summary(latest_probe),
+                        severity=Severity.ERROR,
+                        impact=(
+                            "MAX не может подключиться через роутерный Channel M; входящие MAX "
+                            "сообщения не поступают до восстановления egress."
+                        ),
+                        operator_hint=(
+                            "Проверь роутерный reverse tunnel, sing-box ingress и VPS listener; "
+                            "/status покажет последнюю egress probe."
+                        ),
+                        auto_recovery=(
+                            "Watchdog продолжит попытки через home_ru_proxy; переключение на "
+                            "hetzner_direct не выполняется автоматически."
+                        ),
+                        notify=False,
+                    )
+
+                if (
+                    latest_probe is not None
+                    and latest_probe.get("ok")
+                    and elapsed >= self_heal_grace_seconds
+                ):
+                    if _self_heal_restart_allowed(
+                        self_heal_state_path,
+                        cooldown_seconds=self_heal_restart_cooldown_seconds,
+                    ):
+                        reason = (
+                            "MAX stays offline after home_ru_proxy probe succeeded "
+                            f"for {int(elapsed)}s"
+                        )
+                        _persist_self_heal_restart(
+                            self_heal_state_path,
+                            reason=reason,
+                            probe=latest_probe,
+                        )
+                        log_event(
+                            logger,
+                            logging.CRITICAL,
+                            "bridge.watchdog.max_self_heal_restart",
+                            stage="watchdog",
+                            outcome="scheduled",
+                            downtime_seconds=int(elapsed),
+                            probe_stage=latest_probe.get("stage"),
+                            latency_ms=latest_probe.get("latency_ms"),
+                            cooldown_seconds=self_heal_restart_cooldown_seconds,
+                        )
+                        if health is not None:
+                            change = await health.report_issue(
+                                "max_link",
+                                code="max_self_heal_restart",
+                                summary=(
+                                    "MAX не выходит в online при рабочем home_ru_proxy — "
+                                    "перезапускаю bridge процесс"
+                                ),
+                                raw_cause=reason,
+                                severity=Severity.ERROR,
+                                impact=(
+                                    "Bridge будет кратко недоступен, затем Docker restart:always "
+                                    "поднимет новый процесс."
+                                ),
+                                operator_hint=(
+                                    "Если рестарты повторяются после cooldown, смотри MAX startup "
+                                    "errors и Channel M probe в логах."
+                                ),
+                                auto_recovery="Процесс завершится сам, Docker пересоздаст bridge.",
+                                notify=True,
+                            )
+                            await emit_health_alert(change)
+                        else:
+                            await send_ops_notification(
+                                "⚠️ MAX не выходит в online при рабочем home_ru_proxy — "
+                                "перезапускаю bridge процесс"
+                            )
+                        restart(reason)
+                    else:
+                        log_event(
+                            logger,
+                            logging.WARNING,
+                            "bridge.watchdog.max_self_heal_restart_suppressed",
+                            stage="watchdog",
+                            outcome="rate_limited",
+                            downtime_seconds=int(elapsed),
+                            cooldown_seconds=self_heal_restart_cooldown_seconds,
+                        )
+
+            if not alert_sent and elapsed >= alert_after_seconds:
+                probe_for_alert = latest_probe or max_adapter.get_last_egress_probe()
+                home_proxy_startup_grace = (
+                    home_proxy_active
+                    and probe_for_alert is not None
+                    and not probe_for_alert.get("ok")
+                    and elapsed < egress_startup_grace_seconds
+                )
+                if home_proxy_startup_grace:
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "bridge.watchdog.max_alert_suppressed",
+                        stage="watchdog",
+                        outcome="suppressed",
+                        reason="home_proxy_startup_grace",
+                        downtime_seconds=int(elapsed),
+                        egress_startup_grace_seconds=egress_startup_grace_seconds,
+                        probe_stage=probe_for_alert.get("stage"),
+                    )
+                    if health is not None:
+                        await health.report_issue(
+                            "max_link",
+                            code="max_egress_startup_wait",
+                            summary=(
+                                f"MAX egress home_ru_proxy недоступен {int(elapsed)}с "
+                                "после старта — жду reverse Channel M"
+                            ),
+                            raw_cause=_probe_summary(probe_for_alert),
+                            severity=Severity.WARNING,
+                            impact=(
+                                "После reboot VPS bridge может подняться раньше, чем домашний "
+                                "reverse tunnel заново подключится к listener."
+                            ),
+                            operator_hint=(
+                                "Ручное действие пока не требуется; watchdog продолжит probe "
+                                "и перейдёт к обычному alert только после startup grace."
+                            ),
+                            auto_recovery=(
+                                "Как только reverse Channel M начнёт отвечать, MAX reconnect "
+                                "loop восстановит связь автоматически."
+                            ),
+                            notify=False,
+                        )
+                    continue
+                self_heal_pending = (
+                    home_proxy_active
+                    and probe_for_alert is not None
+                    and bool(probe_for_alert.get("ok"))
+                    and elapsed < self_heal_grace_seconds
+                    and _self_heal_restart_allowed(
+                        self_heal_state_path,
+                        cooldown_seconds=self_heal_restart_cooldown_seconds,
+                    )
+                )
+                if self_heal_pending:
+                    if not self_heal_pending_reported:
+                        log_event(
+                            logger,
+                            logging.INFO,
+                            "bridge.watchdog.max_alert_suppressed",
+                            stage="watchdog",
+                            outcome="suppressed",
+                            reason="self_heal_pending",
+                            downtime_seconds=int(elapsed),
+                            self_heal_grace_seconds=self_heal_grace_seconds,
+                            probe_stage=probe_for_alert.get("stage"),
+                        )
+                        if health is not None:
+                            await health.report_issue(
+                                "max_link",
+                                code="link_offline_self_heal_pending",
+                                summary=(
+                                    f"MAX недоступен уже {int(elapsed)}с — "
+                                    "ожидаю автоматический self-heal restart"
+                                ),
+                                raw_cause="MAX client is offline while home_ru_proxy probe is healthy",
+                                severity=Severity.ERROR,
+                                impact=(
+                                    "Новые MAX сообщения временно не приходят; если reconnect не "
+                                    "восстановится сам, watchdog перезапустит bridge процесс."
+                                ),
+                                operator_hint=(
+                                    "Ручное действие пока не требуется. Если после self-heal "
+                                    "MAX не восстановится, следующий alert попросит проверить /status."
+                                ),
+                                auto_recovery=(
+                                    "Watchdog дождётся self-heal grace и перезапустит процесс, "
+                                    "если MAX останется offline."
+                                ),
+                                notify=False,
+                            )
+                        self_heal_pending_reported = True
+                    continue
+
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "bridge.watchdog.max_alert",
+                    stage="watchdog",
+                    outcome="alerted",
+                    downtime_seconds=int(elapsed),
+                )
+                if health is not None:
+                    current_issue = max_adapter.get_last_issue()
+                    if current_issue is None:
+                        change = await health.report_issue(
+                            "max_link",
+                            code="link_offline",
+                            summary=f"MAX недоступен уже {int(elapsed)}с — идёт переподключение",
+                            raw_cause="MAX client is offline / reconnect loop active",
+                            severity=Severity.ERROR,
+                            impact=(
+                                "Новые MAX сообщения не приходят, а история за время disconnect "
+                                "не воспроизводится автоматически."
+                            ),
+                            operator_hint=(
+                                "Если reconnect затянулся, проверь /status и при необходимости сделай "
+                                "reauth по SMS."
+                            ),
+                            auto_recovery="MAX reconnect loop уже запущен и продолжит попытки автоматически.",
+                            notify=True,
+                        )
+                        await emit_health_alert(change)
+                else:
+                    await send_ops_notification(
+                        f"⚠️ MAX недоступен уже {int(elapsed)}с — идёт переподключение"
+                    )
+                alert_sent = True
+
+
+async def run_dm_history_sweep(
+    *,
+    repo: Repository,
+    max_adapter: MaxBridgePort,
+    poll_interval: int | None = None,
+    enabled: bool = True,
+    warmup_seconds: int = 10 * 60,
+    warmup_interval_seconds: int = 120,
+    steady_interval_seconds: int = 15 * 60,
+    limit: int = 30,
+    backfill_seconds: int = MAX_DM_SWEEP_BACKFILL_SECONDS,
+    cycle_jitter_seconds: int = 30,
+    per_chat_delay_seconds: float = 0.5,
+    jitter_fn: Callable[[float, float], float] | None = None,
+):
+    if poll_interval is not None:
+        warmup_interval_seconds = poll_interval
+        steady_interval_seconds = poll_interval
+        if cycle_jitter_seconds == 30:
+            cycle_jitter_seconds = 0
+        if per_chat_delay_seconds == 0.5:
+            per_chat_delay_seconds = 0.0
+    warmup_interval_seconds = max(1, int(warmup_interval_seconds))
+    steady_interval_seconds = max(1, int(steady_interval_seconds))
+    warmup_seconds = max(0, int(warmup_seconds))
+    cycle_jitter_seconds = max(0, int(cycle_jitter_seconds))
+    per_chat_delay_seconds = max(0.0, float(per_chat_delay_seconds))
+    jitter = jitter_fn or random.uniform
+
+    log_event(
+        logger,
+        logging.INFO,
+        "bridge.dm_history_sweep.worker_started",
+        stage="history_sweep",
+        outcome="started",
+        enabled=enabled,
+        warmup_seconds=warmup_seconds,
+        warmup_interval_seconds=warmup_interval_seconds,
+        steady_interval_seconds=steady_interval_seconds,
+        limit=limit,
+        backfill_seconds=backfill_seconds,
+        cycle_jitter_seconds=cycle_jitter_seconds,
+        per_chat_delay_seconds=per_chat_delay_seconds,
+    )
+    if not enabled:
+        log_event(
+            logger,
+            logging.INFO,
+            "bridge.dm_history_sweep.disabled",
+            stage="history_sweep",
+            outcome="skipped",
+            reason="disabled",
+        )
+        return
+
+    ready_since: float | None = None
+
+    async def is_known_message(chat_id: str, msg_id: str) -> bool:
+        result = repo.is_duplicate(str(msg_id), str(chat_id))
+        if inspect.isawaitable(result):
+            result = await result
+        return bool(result)
+
+    while True:
+        next_interval = steady_interval_seconds
+        try:
+            if not max_adapter.is_ready():
+                ready_since = None
+                log_event(
+                    logger,
+                    logging.INFO,
+                    "bridge.dm_history_sweep.skipped",
+                    stage="history_sweep",
+                    outcome="skipped",
+                    reason="max_not_ready",
+                    next_interval_seconds=warmup_interval_seconds,
+                )
+                await asyncio.sleep(warmup_interval_seconds)
+                continue
+
+            now = time.time()
+            if ready_since is None:
+                ready_since = now
+            phase = "warmup" if now - ready_since < warmup_seconds else "steady"
+            next_interval = (
+                warmup_interval_seconds if phase == "warmup" else steady_interval_seconds
+            )
+            since_ts = int(time.time()) - int(backfill_seconds)
+            bindings = await repo.list_bindings()
+            checked_chats = 0
+            skipped_chats = 0
+            replayed_total = 0
+            for binding in bindings:
+                if not max_adapter.is_ready():
+                    break
+                chat_id = str(binding.max_chat_id)
+                if binding.mode != "active":
+                    skipped_chats += 1
+                    continue
+                if chat_id.startswith("-") or is_probable_client_cid(chat_id):
+                    skipped_chats += 1
+                    continue
+                flow_id = build_max_flow_id(chat_id, "history-sweep")
+                replayed_total += await max_adapter.replay_recent_history(
+                    chat_id,
+                    limit=limit,
+                    since_ts=since_ts,
+                    flow_id=flow_id,
+                    is_known_message=is_known_message,
+                )
+                checked_chats += 1
+                if per_chat_delay_seconds > 0:
+                    await asyncio.sleep(per_chat_delay_seconds)
+            sleep_jitter = (
+                float(jitter(0, cycle_jitter_seconds)) if cycle_jitter_seconds else 0.0
+            )
+            log_event(
+                logger,
+                logging.INFO,
+                "bridge.dm_history_sweep.cycle_finished",
+                stage="history_sweep",
+                outcome="completed",
+                phase=phase,
+                checked_chats=checked_chats,
+                skipped_chats=skipped_chats,
+                replayed_count=replayed_total,
+                next_interval_seconds=next_interval,
+                jitter_seconds=round(sleep_jitter, 3),
+            )
+        except Exception as e:
+            log_event(
+                logger,
+                logging.ERROR,
+                "bridge.dm_history_sweep.worker_failed",
+                stage="history_sweep",
+                outcome="failed",
+                error=str(e),
+            )
+            sleep_jitter = 0.0
+        await asyncio.sleep(next_interval + sleep_jitter)
+
+
+async def cleanup_phantom_topics(
+    *,
+    repo: Repository,
+    tg: TelegramBridgePort,
+) -> dict[str, int]:
+    finder = getattr(repo, "find_phantom_topic_bindings", None)
+    if not callable(finder):
+        return {"found": 0, "deleted": 0, "closed": 0, "disabled": 0}
+    bindings = await finder()
+    stats = {"found": len(bindings), "deleted": 0, "closed": 0, "disabled": 0}
+    for binding in bindings:
+        flow_id = build_max_flow_id(binding.max_chat_id, "phantom-cleanup")
+        deleted = False
+        delete_topic = getattr(tg, "delete_topic", None)
+        if callable(delete_topic):
+            deleted = bool(await delete_topic(binding.tg_topic_id, flow_id=flow_id))
+        if deleted:
+            stats["deleted"] += 1
+        else:
+            close_topic = getattr(tg, "close_topic", None)
+            if callable(close_topic) and await close_topic(binding.tg_topic_id, flow_id=flow_id):
+                stats["closed"] += 1
+
+        await repo.update_mode(binding.max_chat_id, "disabled")
+        await repo.update_title(
+            binding.max_chat_id,
+            f"[deleted phantom] {binding.title}",
+        )
+        stats["disabled"] += 1
+        log_event(
+            logger,
+            logging.INFO,
+            "bridge.phantom_topic.cleaned",
+            flow_id=flow_id,
+            stage="maintenance",
+            outcome="cleaned",
+            max_chat_id=binding.max_chat_id,
+            tg_topic_id=binding.tg_topic_id,
+            deleted=deleted,
+        )
+    return stats
+
+
+async def run_cleanup(
+    *,
+    cfg: AppConfig,
+    repo: Repository,
+    health: Optional[RuntimeHealthStore],
+):
+    while True:
+        await asyncio.sleep(1800)
+        try:
+            await repo.cleanup_old_messages(cfg.bridge.message_retention_days)
+            await repo.cleanup_old_logs(cfg.bridge.log_retention_days)
+            purge_media_cache = getattr(repo, "purge_expired_media_recovery_cache", None)
+            purged_media_cache = (
+                await purge_media_cache()
+                if callable(purge_media_cache)
+                else 0
+            )
+            if health is not None:
+                await health.mark_healthy(
+                    "storage",
+                    summary="SQLite storage отвечает и cleanup проходит штатно",
+                    notify=False,
+                )
+                await health.mark_healthy(
+                    "scheduler",
+                    summary="Cleanup scheduler работает штатно",
+                    notify=False,
+                )
+            log_event(
+                logger,
+                logging.INFO,
+                "bridge.cleanup.completed",
+                stage="maintenance",
+                outcome="completed",
+                message_retention_days=cfg.bridge.message_retention_days,
+                log_retention_days=cfg.bridge.log_retention_days,
+                media_recovery_cache_ttl_hours=getattr(
+                    cfg.bridge,
+                    "media_recovery_cache_ttl_hours",
+                    48,
+                ),
+                purged_media_recovery_cache=purged_media_cache,
+            )
+        except Exception as e:
+            log_event(
+                logger,
+                logging.ERROR,
+                "bridge.cleanup.failed",
+                stage="maintenance",
+                outcome="failed",
+                error=str(e),
+            )
+            if health is not None:
+                await health.report_issue(
+                    "storage",
+                    code="cleanup_failed",
+                    summary="Cleanup старых записей в storage завершился ошибкой",
+                    raw_cause=str(e),
+                    severity=Severity.ERROR,
+                    impact="Retention cleanup не выполнен; data/ может разрастаться и health-state устаревать.",
+                    operator_hint="Проверь SQLite права/целостность и свободное место на диске.",
+                    auto_recovery="Следующая попытка cleanup будет автоматически через 30 минут.",
+                    notify=False,
+                )
+
+
+async def run_weekly_recovery_snapshot(
+    *,
+    safe_scan: Callable[..., Awaitable[dict[str, object]]],
+    health: Optional[RuntimeHealthStore],
+    log_scan_failure: Callable[..., None],
+    interval_seconds: int = 7 * 24 * 3600,
+):
+    """Periodic recovery registry refresh. Default cadence: weekly."""
+    await asyncio.sleep(max(1, int(interval_seconds)))
+    while True:
+        try:
+            await safe_scan(reason="weekly", notify=True)
+            if health is not None:
+                await health.mark_healthy(
+                    "scheduler",
+                    summary="Weekly MAX recovery snapshot обновляется",
+                    notify=False,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_scan_failure(reason="weekly", error=e)
+            if health is not None:
+                await health.report_issue(
+                    "scheduler",
+                    code="recovery_snapshot_failed",
+                    summary="Weekly MAX recovery snapshot не обновился",
+                    raw_cause=type(e).__name__,
+                    severity=Severity.WARNING,
+                    impact="Recovery registry может устареть до следующей успешной попытки.",
+                    operator_hint="Проверь MAX-сессию и выполни /recovery scan вручную.",
+                    auto_recovery="Scheduler повторит weekly snapshot на следующем цикле.",
+                    notify=False,
+                )
+        await asyncio.sleep(max(1, int(interval_seconds)))

@@ -1,0 +1,225 @@
+# CLAUDE.md — MAX→Telegram Bridge
+
+Контекст проекта для Claude Code. Читается автоматически при каждой сессии.
+
+## Что это
+
+Личный bridge-сервис: сообщения из российского мессенджера **MAX** → **Telegram Forum Supergroup**.
+Один пользователь, один активный MAX account, один Telegram бот. Не SaaS, не multi-tenant.
+
+**Цель:** не устанавливать MAX, получать все сообщения в Telegram и отвечать обратно.
+
+## Архитектура (одна строчка)
+
+```
+Supervisor ──► Worker(MAX Adapter ──► Bridge Core ──► TG Adapter) ──► Telegram Topics
+                     │
+          SQLite DB + persisted runtime health files
+```
+
+Каждый MAX-чат = отдельный топик в Telegram Forum Supergroup. Reply в топике = ответ в MAX.
+
+## Компоненты
+
+| Файл | Ответственность |
+|------|----------------|
+| `src/main.py` | Тонкий entry point: logging, config load, health store, supervisor |
+| `src/startup/composition.py` | Runtime composition root: Repository, adapters, BridgeCore, startup notifications |
+| `src/adapters/max/adapter.py` (`src/adapters/max_adapter.py`) | MAX facade: operation services with explicit deps over internal backend boundary; старый import path сохранён |
+| `src/adapters/max/network/` | MAX-only egress abstraction: direct socket, authenticated HTTP CONNECT, aiohttp proxy options; не используется TG/core |
+| `src/adapters/max/backends/pymax/` | Единственная текущая pymax implementation boundary (`Client + ExtraConfig`, PyMax 2 transport/events/raw gateway/models/media helpers) |
+| `src/adapters/max/{payload,users,errors,media/*}.py` | Pymax-free MAX helper leaves: payload parsing, names, error classification, CDN UA/download |
+| `src/adapters/tg/adapter.py` (`src/adapters/tg_adapter.py`) | aiogram бот: топики, send, recv reply; старый import path сохранён |
+| `src/adapters/tg/notifier.py` | Owner DM / ops topic notifications and alert outbox flush |
+| `src/bridge/contracts.py` | Транспортно-нейтральные dataclass-модели и Protocol-порты между core и adapters |
+| `src/bridge/core.py` + `src/bridge/{forwarding,replies,topics,status,media_retry,...}.py` | Core — runtime coordinator; forwarding/replies/topics/status/media-retry/commands/recovery живут в leaf modules |
+| `src/runtime/health/` | Health snapshot, health events, alert outbox, heartbeat; package-level imports сохранены |
+| `src/runtime/status_api.py` | Read-only status API на loopback для внешнего watchdog (`/healthz`, `/status`) |
+| `src/runtime/supervisor.py` | Worker restart loop, heartbeat, crash alerts |
+| `src/watchdog_external/` | Внешний watchdog для второго VPS: stdlib-only, не импортирует модули bridge |
+| `deploy/external-watchdog/` | Docker-стек внешнего watchdog + `deploy.sh` |
+| `infra/ansible/roles/watchdog_peer/` | Агент production-хоста: read-only проба и push-таймер |
+| `src/config/loader.py` | YAML конфиг + env переменные |
+| `src/db/models.py` | SQLite схема: routing, delivery, retry, users, recovery registry |
+| `src/db/repository.py` + `src/db/repos/*.py` | Repository facade + subdomain repos over one `aiosqlite.Connection` |
+| `infra/ansible/` | Ansible playbooks: deploy, backup, recover, bootstrap, hardening (см. `infra/ansible/README.md`) |
+
+## База данных (SQLite)
+
+**Никакого контента сообщений:**
+
+- `chat_bindings` — `max_chat_id ↔ tg_topic_id`, режим чата
+- `message_map` — `max_msg_id ↔ tg_msg_id` (дедупликация + reply routing)
+- `tg_reply_map` — дополнительные TG message ids для reply routing поздно досланных медиа
+- `delivery_log` — статусы доставки (meta only)
+- `pending_media_downloads` — durable retry meta для MAX media
+- `media_recovery_cache` — короткий encrypted TTL-cache только для проблемных MAX media hints (`UNSUPPORTED`, download failure, partial delivery); stable refs открыто как meta, volatile URL/payload только Fernet ciphertext, без текста/raw event
+- `pending_inbound_messages` / `pending_outbound_messages` — durable retry для MAX→TG и TG→MAX текстов; хранит plaintext только для недоставленных текстов до доставки/TTL, медиа не сохраняет
+- `telegram_callback_actions` — owner-only Telegram callback actions; хранит только MAX invite payload для `max_join`, внешние URL не сохраняет
+- `known_users` — справочник имён MAX для `/dm`
+- `max_account_generations` — поколения MAX account; новый телефон = новый account
+- `chat_recovery_registry` — recovery metadata для переноса Telegram topics на новый MAX account (`last_scan_at`, invite/admin/DM metadata, manual notes)
+- `dm_contact_recovery_registry` — DM-only recovery contacts из typed dialog snapshots/привязанных DM topics; не `client.contacts` и не весь `known_users`
+- `chat_recovery_events` — append-only audit recovery lifecycle без message text/raw payload
+
+## Recovery registry / новый телефон
+
+- MAX phone migration трактуется как новый MAX account.
+- Bridge сохраняет Telegram continuity, но не клонирует MAX account и не возвращает закрытые чаты без invite/admin approval.
+- DM contacts для восстановления — только люди из реальных личных MAX dialogs; полная address book и group writers из `known_users` не копируются.
+- Safe recovery scan запускается после MAX connect/reconnect, раз в неделю и event-driven при `new_binding`, `title_changed`, MAX `CONTROL`.
+- Event-driven scans ставятся через `asyncio.create_task`, debounce/cooldown и не должны задерживать forwarding, topic creation или rename.
+- Auto recovery scans не шлют отдельный Telegram-spam по обычным дельтам (`unmapped`, `needs_invite`, DM contact changes): агрегированная выжимка попадает в 4-часовой `/status`. Срочный owner/ops alert остаётся только для смены MAX account / migration-required. Без invite links, notes, phones, contact names, message text, titles или raw MAX fields.
+- Команды владельца: `/recovery scan`, `/recovery report`, `/recovery export`, `/recovery contacts status`, `/recovery contacts snapshot [--force]`, `/recovery contacts import dry-run|apply`, `/recovery set <topic_id> key=value ...`, `/recovery remap <topic_id> <new_max_chat_id>`.
+- `data/recovery_contacts.enc.json` — отдельный encrypted phonebook snapshot для переноса на новый номер через PyMax `import_contacts()`. Открытая часть файла содержит только schema/cipher/timestamp/source account hash/counts/ciphertext; телефоны остаются только внутри Fernet payload. Ключ `MAX_RECOVERY_CONTACTS_KEY` хранится в `.env.secrets`. Raw phones не пишутся в SQLite, logs, health, `/status`, `/recovery report` или обычный `/recovery export`.
+- `/recovery export` уходит только owner DM и может содержать invite links/admin notes.
+- После remap reply на старое TG сообщение отправляется без `reply_to_msg_id`, если mapped MAX message принадлежит старому `max_chat_id`.
+
+## MAX invite/link buttons в Telegram
+
+- `SHARE`, `inline_keyboard`, nested `web_app.url` / `buttons[].url` и URL из msgpack text payload нормализуются в transport-neutral `MaxMessage.actions`.
+- `max.ru/join/...` становится owner-only callback-кнопкой `Вступить в MAX`; bridge MAX account вступает через PyMax API, не через открытие MAX на телефоне.
+- Внешние `http(s)` ссылки становятся обычными Telegram URL-кнопками и не пишутся в SQLite.
+- В SQLite сохраняется только `telegram_callback_actions.payload_json` для MAX invite join callback. Raw SHARE/keyboard payloads, arbitrary external URLs, message text/media и signed URLs не писать в логи, health, reports или exports.
+
+## Критические особенности pymax
+
+> Это знание получено через debugging — **не терять**.
+
+- `BridgeCore` не импортирует `pymax`/`aiogram` и не зависит от concrete adapters: общие модели (`MaxMessage`, `MaxAttachment`, recovery snapshot) и Protocol-порты живут в `src/bridge/contracts.py`. Pymax-грабли и protocol hooks остаются внутри `src/adapters/max/` (`src/adapters/max_adapter.py` — compatibility import).
+- `pymax` imports и форма pymax-клиента разрешены только внутри `src/adapters/max/backends/pymax/*`. `MaxAdapter` — facade over operation services with explicit deps and typed MAX client ports; замена pymax в будущем означает новый `MaxBackend`/client port adapter, а не изменение `BridgeCore` или operation services. Проверки: `tests/test_bridge_contracts.py::test_pymax_imports_stay_inside_max_adapter_boundary`, `test_max_adapter_uses_composition_not_mixins`, `test_max_services_use_explicit_dependencies`, `test_max_operation_services_do_not_use_pymax_client_shape_directly`, `tests/test_max_service_ports.py`, `tests/test_max_adapter_leaves.py::test_max_adapter_can_be_composed_with_fake_backend`.
+- `message.sender` — это `int` (user_id), **не** User-объект
+- `message.chat_id` — `int`; положительный = DM, отрицательный = группа
+- `User.names: list[Names]` — имя через `names[0].first_name / last_name / name`
+- PyMax 2 `client.chats` может содержать dialogs/groups/channels; backend фильтрует их по `Chat.type`
+- `dialogs_snapshot()` — typed DTO поверх `client.chats` с `Chat.type == DIALOG`; старого public `client.dialogs` в PyMax 2 нет
+- `client.get_cached_user(id)` — синхронный кеш пользователей
+- **DM chat_id ≠ всегда ID собеседника**: когда наш аккаунт инициирует DM, MAX-echo может вернуть `chat_id == own_id`. Либо `resolve_user_name(chat_id)` фейлится для нового контакта и код откатывается к `sender_id == own_id`. В обоих случаях имя собеседника нужно искать через typed `dialogs_snapshot()` → `participants` (фильтруя `own_id`). Реализовано в `MaxAdapter.get_dm_partner_id()`.
+- Signed OK CDN URL для MAX-видео чувствительны к `User-Agent`: выбирать клиент по `srcAg` (`CHROME`, `CHROME_ANDROID`, `CHROME_IPHONE`, Safari/iPhone fallback). При обрыве скачивания использовать `*.part` + `Range`; если CDN не поддержал докачку, перекачивать с нуля.
+- `Client(..., extra_config=ExtraConfig(reconnect=False, telemetry=False))` — **обязательно оба флага**
+  - `reconnect=True` → не использовать: bridge держит outer reconnect loop со свежим client
+  - `telemetry=True` → не использовать: сохраняем минимальный telemetry/privacy posture
+- PyMax 2 session store должен подхватывать legacy PyMax 1 table `auth(token, device_id)` через `src/adapters/max/backends/pymax/session_store.py`. Иначе PyMax 2 считает, что сессии нет, начинает SMS-auth (`AUTH_REQUEST`) и уходит в rate-limit.
+- Existing PyMax 1 `SocketMaxClient` sessions были DESKTOP sessions. PyMax 2 factory использует v1-compatible `DeviceType.DESKTOP` user-agent и sync overrides `0`; default Android profile может дать `LOGIN login.cred / FAIL_WRONG_PASSWORD` на старом token. Версия и build number DESKTOP profile берутся из bundled `VersionCatalog.recommended()`: старый version string может получить `client.unsupported-version` ещё до SMS auth.
+- После включения/изменения MAX password/SMS сервер может инвалидировать старый token (`FAIL_LOGIN_TOKEN`, `requires_reauth=true`). Штатный путь: остановить bridge, запустить `python scripts/max_reauth.py` в compose one-shot, ввести SMS/2FA в интерактивном терминале, затем снова поднять bridge. Reauth path должен отключать legacy PyMax 1 `auth` import, иначе старый token импортируется обратно. Если валидный mobile handshake не содержит `calls_seed`, backend-local `BridgeAuthService` посылает только этот `AUTH_REQUEST` без optional desktop fingerprint; обычный fingerprint path и сохранённый DESKTOP session не меняются.
+- Не делать профилактический/автоматический MAX reauth. Обычный offline/reboot/week-away сценарий должен использовать существующий persisted device token как обычный клиент; reauth разрешён только при явном `requires_reauth=true`/invalid token или осознанной ручной проверке с остановленным bridge. Перед reauth сохранять snapshot `session.db`; не запускать второй MAX-клиент рядом с работающим bridge.
+- `Opcode.SESSIONS_CLOSE` нельзя использовать как точечное закрытие одной старой сессии: live-проверка показала, что вызов с `{"time": ...}` привёл к `FAIL_LOGOUT_ALL` и инвалидировал desktop tokens. Старые MAX sessions закрывать только вручную в телефоне, пока не будет подтверждённого безопасного payload/API.
+- MAX initial sync может вернуть `lastMessage.attaches.type=UNSUPPORTED`; upstream PyMax 2 `LoginResponse` strict union падает. `src/adapters/max/backends/pymax/login.py` ставит backend-local `BridgeAuthService`, который удаляет только unknown attachments до validation.
+- PyMax 2.1.2 `LoginResponse.token` optional: MAX может не вернуть новый token при логине с уже существующей session, а upstream `App.start()` должен сохранить текущий session token. `BridgeAuthService` больше не подставляет `session.token` в response; он остаётся только для unsupported attachments / non-critical initial-sync payload drift.
+- PyMax 2.3.0 добавил `ContactInfo`, `Client.import_contacts()`, `on_disconnect()`, `on_error()`, `relogin()`, `delete_chat()` и `SessionStore.delete_all_sessions()`. Bridge использует `import_contacts()` только для encrypted recovery contacts import, `on_disconnect()` только для безопасной диагностики/disconnected-state, не использует `on_error()` как passive logging и не заменяет guarded reauth flow на `relogin()`.
+- PyMax 2.3.1 добавил `Client.forward_message()` / `Message.forward()`, исправил compressed TCP payload decoding (`Zstandard` flag `0xFF`, LZ4 handling) и bot profile parsing. Bridge пока не exposes MAX→MAX forwarding в core, но pin-ит surface; backend-local msgpack guard должен заменять только serializer и сохранять upstream `TcpPayloadDecoder`/`ZstdCompression`.
+- PyMax 2.4.0 возвращает список из `fetch_history()`, поддерживает `Voice`/`VideoNote`/опросы и исправляет lifecycle, повторную авторизацию и partial attachment parsing. Bridge уже нормализует пустую историю через `messages or []`, не использует новые outgoing voice/poll APIs без отдельной задачи и проверяет реальный `ShareAttachment.url` через adapter regression.
+- PyMax 2.4.1 создаёт runtime лениво и добавляет one-shot `Client.connect()`, version-aware client config, session `user_agent` migration и Max CA для `api2.oneme.ru`. `BridgeClient._ensure_runtime()` обязан ставить bridge-local auth/user/TCP hooks только после создания runtime; `PymaxClientAdapter` использует `connect()` и ждёт закрытия connection, а `EgressTCPTransport` передаёт upstream `_ssl_ctx`, чтобы не потерять Max CA. В `ExtraConfig` обязательно `relogin=False`: автоматический upstream reset/SMS/2FA запрещён, reauth остаётся только явным operator flow.
+- PyMax 2.4.1 public `Client.get_video_by_id(chat_id, message_id, video_id)` / `VideoRequest.url` — primary path для playable video URL. Raw `VIDEO_PLAY` допустим только как isolated fallback в pymax backend; signed URL/token не логируются и не хранятся plaintext. Deferred video recovery ограничен шестью попытками каждые 180 секунд после initial failure.
+- PyMax `join_group(link)` / `join_channel(link)` используются только внутри `src/adapters/max/backends/pymax/`; bridge core видит transport-neutral `join_chat_by_link(link)` port и safe `MaxJoinedChat`.
+- PyMax 2 может отдать `message.text` как `bytes`; для SHARE/сложных payload это может быть msgpack-like binary, а не plain UTF-8. `MaxEventsService` сначала пробует извлечь `text` через msgpack, затем strict UTF-8, и не форвардит binary garbage с `�`.
+- MAX forwarded/channel events могут приходить как wrapper без прямого `text/attaches`, но с nested `message` или `link.message`; raw receive и empty recovery должны unwrap-ать `CHANNEL/FORWARD` до проверки content. Симптом старого бага: `max.inbound.empty_recovery ... reason=*_without_content` при safe fields `link`/`_forward_source_*`, либо `max.raw.message_skipped reason=missing_chat_id` для прямого `CHANNEL` с media.
+- MAX `link.type=REPLY` нельзя unwrap-ать как forward: linked id должен дойти в `MaxMessage.reply_to_msg_id`, затем разрешиться только в Telegram message того же MAX chat/current topic. Native reply ставится только на первую успешную Telegram part; ненайденный/stale reply получает marker без цитаты. Для forward bridge показывает `ForwardLink.chat_name`, если MAX его передал, иначе title из уже загруженного MAX cache; live lookup, отдельная SQLite/health/log persistence запрещены. При обоих miss остаётся нейтральный marker. При временном TG failure marker остаётся внутри уже разрешённого plaintext retry-text до delivery/TTL. Outbound `message_map` обязан сохранять исходный `tg_msg_id`.
+- PyMax 2 TCP msgpack decoder может падать на raw `CHAT_HISTORY`, если MAX отдаёт map с array-like key (`TypeError: unhashable type: 'list'`). `src/adapters/max/backends/pymax/transport.py` ставит backend-local `BridgeMsgpackPayloadCodec`, который конвертирует такие keys в hashable форму до нормализации payload.
+- PyMax 2 TCP `seq` в upstream растёт до `0xFFFFFFFF`, но TCP framer пакует его в one-byte поле; после `255` возникает `struct.error: 'B' format requires 0 <= number <= 255` и ломаются `CHAT_HISTORY`/TG→MAX sends. `src/adapters/max/backends/pymax/transport.py` ставит `BridgeConnectionManager`/sequence guard с wrap `% 0x100`; regression marker: `pymax_tcp_sequence_overflow`.
+- PyMax 2 native `on_raw()` используется вместо старого private `_handle_message_notifications` patch; raw requests изолированы в backend `raw_gateway.py` через `client._app.invoke(...)`.
+- MAX egress выбирается только внутри `src/adapters/max/`: `home_ru_proxy` использует authenticated HTTP CONNECT к VPS-local reverse Channel M listener, который держится исходящим SSH remote-forward с домашнего РФ роутера; `hetzner_direct` оставляет старый direct egress с VPS. Автоматического fallback нет: при падении proxy MAX деградирует с issue `max_egress_unavailable`, но сам не переключается на Hetzner direct.
+- Reconnect реализован вручную: `while True: client = make_client(); await client.start()`
+- `MaxAdapter.is_ready()` должен учитывать реальный `client.is_connected`, а не только `_started`: после роутерного flap PyMax 2 может закрыть TCP transport, но не вернуть управление из `start()`.
+- `PymaxClientAdapter.is_connected` должен проверять `ConnectionManager.is_open()` как callable и фактический `transport.connected`; иначе stale TCP socket выглядит healthy, а TG→MAX падает `Not connected to the server` без watchdog reconnect.
+- `send_message` ждёт до 15 сек если `_started=False` (reconnect window)
+- DM history sweep должен ждать `max_adapter.is_ready()`: запуск `CHAT_HISTORY` до `MAX connected` даёт пачку `Not connected`/pending future шумов и может мешать диагностике reauth/reconnect.
+- DM history sweep должен быть бережным к MAX API: balanced config живёт в `health.dm_history_sweep` (`120s` warmup после старта/reconnect, затем `900s` steady, jitter и per-chat delay). `replay_recent_history` получает pre-dedup callback через существующий `message_map`, чтобы не нормализовать/качать повторно уже доставленные history messages; pending empty recovery не пропускать.
+
+## Границы watchdog в production
+
+Внутренние уровни работают на Hetzner production VPS, не на домашнем роутере, и **восстанавливают**:
+
+- `BridgeSupervisor` — PID1 внутри `bridge` Docker-контейнера. Он перезапускает аварийно завершившийся worker, пока сам контейнер жив.
+- MAX watchdog — background task того же worker. При исправном `home_ru_proxy` и зависшем MAX он делает rate-limited self-exit; Docker `restart: always` поднимает свежий контейнер.
+- Docker Engine того же VPS применяет `restart: always` после аварийного завершения процесса или рестарта Docker/VM.
+- Docker `HEALTHCHECK` только сообщает `unhealthy` по stale heartbeat; он не рестартует контейнер.
+- Явный `docker compose stop`/`down` останавливает все внутренние watchdog-и и не отменяется `restart: always`; восстановление — только явным `docker compose ... up -d bridge` или обычным Ansible deploy. Не запускать второй экземпляр bridge параллельно.
+
+Внешний наблюдатель живёт на **втором VPS** (хост-наблюдатель) и только **сообщает**, ничего не чинит:
+
+- Модель отказов, каталог правил, пороги и учения — `docs/runbooks/watchdog.md`; решение — `docs/decisions/ADR-012-external-watchdog.md`.
+- Три класса отказов ненаблюдаемы изнутри и существуют ради внешнего слоя: сломанный собственный канал алертов bridge (`alert_outbox` растёт), остановленный контейнер (`restart: always` на явный stop не действует) и мёртвый хост.
+- L1 — `status_api` bridge на `127.0.0.1:18140` (`src/runtime/status_api.py`). Только loopback: постулат «bridge не принимает входящие подключения» сохраняется, наружу API уходит через SSH-канал. Без `BRIDGE_STATUS_TOKEN` сервер не поднимается. В payload нет текстов, названий чатов и `raw_cause` — закреплено тестом.
+- L2 — контейнер `maxtg-watchdog` на хосте-наблюдателе: TCP-проба + SSH forced command `command="/usr/local/bin/bridge-status-probe.py",restrict`. Ключ наблюдателя физически не даёт shell и права записи на production.
+- L3 — push dead-man's switch: таймер `maxtg-watchdog-push.timer` на production → приёмник `:18151` у наблюдателя, HMAC-SHA256 + окно времени. Нужен, чтобы отличать «bridge умер» от «сломан канал наблюдения».
+- L4 — мета-мониторинг: host-мониторинг на хосте-наблюдателе видит пропажу контейнера, встречная проба между хостами видит смерть наблюдателя, плюс сводка «наблюдатель жив» 4 раза в сутки.
+- Сводка состояния уходит 4 раза в сутки (`WATCHDOG_SUMMARY_HOURS_UTC=6,10,14,18` = 09/13/17/21 МСК); команда `/watchdog` показывает устройство сервиса и запрашивает внеочередную проверку кнопкой через тот же подписанный канал `:18151/check`. Команду обрабатывает сам bridge, поэтому при его смерти кнопка не работает — это удобство, а не механизм безопасности.
+- Алерты идут ботом bridge в owner DM + ops topic с шапкой источника; запрос уходит с хоста-наблюдателя напрямую в Telegram API, поэтому не зависит от живости процесса bridge.
+- Код внешнего watchdog — `src/watchdog_external/` (**только stdlib**, не импортирует модули bridge), деплой — `deploy/external-watchdog/`, агент production-хоста — `infra/ansible/roles/watchdog_peer/`.
+- Правила firewall (allow 22 с /32 наблюдателя на production, allow 18151 с /32 production у наблюдателя) заводятся вручную и в UFW, и в панели провайдера — автоматизации нет.
+
+## Принципы (не нарушать)
+
+1. **Privacy first** — текст сообщений и медиа не логируются, не хранятся в DB; исключения: durable text retry queues временно держат plaintext недоставленных текстов до доставки/TTL, а `media_recovery_cache` до 48ч держит только encrypted media hints для проблемных вложений без message text/full raw
+2. **Whitelist by default** — `forward_all: true` в конфиге; режим per-chat переопределяет
+3. **Idempotency** — `max_msg_id` сохраняется до отправки в TG (idempotency key)
+4. **No third parties** — всё self-hosted, никаких GREEN-API и подобных
+5. **Единственный процесс** — не запускать два экземпляра (двойной userbot = проблемы)
+6. **Git push только по явной просьбе** — после изменений не делать push автоматически, спросить сначала
+7. **Деплой на Hetzner только по явной просьбе** — после изменений не обновлять сервер автоматически, спросить сначала
+8. **Аварийный deploy** — если недоступен control channel Ansible, следовать public runbook: backup-first, только exact уже отправленный commit, private state/env остаются на сервере. Временный admin access — только точный `/32` в Cloud Firewall и UFW; не открывать SSH всему интернету.
+9. **Инфраструктурные детали не попадают в публичный git** — репозиторий публичный, поэтому в трекаемых файлах (код, docs, README, CLAUDE.md, ansible, compose, примеры конфигов, имена директорий, тексты коммитов) не должно быть: реальных IP и hostname, имён и алиасов конкретных VPS, SSH-пользователей и портов, провайдеров конкретных хостов, токенов, ключей, телефонов, chat/topic id. Писать роль, а не идентичность: «production-хост», «хост-наблюдатель», `<vps_ip>`, `<observer_ip>`, `deploy@<host>`. Реальные значения живут только в `.env.secrets`, `config.local.yaml`, `infra/ansible/inventory/production.ini` и vault — всё это в `.gitignore`. Исключение — уже существующие имена конфигурационных профилей (`hetzner_direct`, `home_ru_proxy`): это значения конфига, а не адреса. Перед коммитом проверять новые файлы на такие утечки.
+
+## Документация
+
+- Поддерживать bilingual public docs: при изменении user-facing/architecture/runbook информации обновлять обе версии, если есть пара. Сейчас пар две: `README.md` ↔ `README-ru.md` и `docs/architecture-tour.md` ↔ `docs/architecture-tour-ru.md`. Без суффикса — английская версия (на неё ссылается англоязычный README), `-ru` — русская.
+- Русский остаётся основным языком operator/runbook/context docs (`CLAUDE.md`, `PROJECT.md`, `docs/runbooks/*`), но public README должен иметь актуальную English и Russian версию без смыслового drift.
+- Архитектурные изменения отражать минимум в `docs/architecture.md`, `docs/tests.md` и, если меняется boundary/decision, в `docs/decisions/*`; навигационные/summary изменения дублировать в README/README-ru.
+- Документация должна описывать фактическое состояние кода после рефакторинга: реальные имена файлов, compatibility import paths, dependency boundaries и текущие operational правила.
+
+## Запуск
+
+```bash
+# Локально
+source .venv/bin/activate
+python -m src.main
+
+# Фоновый (с логом)
+nohup .venv/bin/python -m src.main >> data/bridge.log 2>&1 &
+
+# Проверить процесс
+ps aux | grep 'python -m src.main' | grep -v grep
+
+# Остановить
+kill $(ps aux | grep 'python -m src.main' | grep -v grep | awk '{print $2}')
+```
+
+## Конфиг и секреты
+
+Секреты — только в `.env.secrets` (не в git):
+```
+TG_BOT_TOKEN, TG_OWNER_ID, TG_FORUM_GROUP_ID, MAX_PHONE,
+MAX_EGRESS_PROXY_URL, MAX_RECOVERY_CONTACTS_KEY
+MAX_EGRESS_PROXY_HOST, MAX_EGRESS_PROXY_GATEWAY   # .env.host для docker compose extra_hosts reverse Channel M
+```
+
+`.env` должен содержать только не-секретные локальные env (`DATA_DIR`, optional `CONFIG_LOCAL_PATH`).
+Базовая конфигурация — в `config.yaml` (в git, без секретов).
+Локальные chat bindings и реальные названия чатов — в `config.local.yaml` (не в git).
+Production `config.local.yaml` должен явно ставить:
+
+```yaml
+max:
+  egress:
+    active: "home_ru_proxy"
+```
+
+`hetzner_direct` — только ручной аварийный режим через изменение конфига оператором; в `/status` он помечается warning-ом `MAX uses non-RU direct egress`.
+
+## Ключевые ограничения
+
+- pymax не воспроизводит историю при reconnect → сообщения во время downtime теряются
+- Telegram Bot API: max 30 msg/sec, файлы до 50 MB
+- Topics в Telegram: названия до 128 символов
+- `dp.start_polling(..., allowed_updates=[...])` обязан включать `callback_query`: без него Telegram не присылает нажатия inline-кнопок и любая кнопка молча не работает (ни `/watchdog`, ни MAX invite join). Закреплено тестом `test_polling_allows_callback_updates`.
+- Ответы команд уходят через `message.reply()` **без `parse_mode`**: HTML-теги приедут в чат как текст. Тексты команд — plain text со структурой на эмодзи; ссылки указывать полными URL, относительные пути в Telegram не кликаются.
+- Бот принимает команды **только от `TG_OWNER_ID`**
+- Исключение: `/dm` в General может быть public для участников группы; `/recovery ...` всегда owner-only
+- Если MAX-вложение после всех retry не скачалось, Telegram должен получить текстовый fallback, а `delivery_log.status` — `partial`, не ложный `delivered`
+
+## Дальнейшее развитие
+
+Подробный план: `docs/roadmap.md`
+Архитектурные решения: `docs/decisions/`
+Операционные процедуры: `docs/runbooks/`

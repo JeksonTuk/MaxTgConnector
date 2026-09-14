@@ -1,0 +1,15 @@
+# Надстройка над docker-compose.staging.yml для постоянной работы на РФ-VPS.
+# Применять вторым -f: базовый staging остаётся источником изоляции
+# (non-root, read_only, cap_drop, лимиты), здесь меняются только два поля.
+#
+#   docker compose -p maxgram-bridge-staging \
+#     -f deploy/docker-compose.staging.yml \
+#     -f deploy/docker-compose.staging.persist.yml up -d
+#
+# OUTBOUND_ENABLED берётся из окружения docker compose (.env.staging через
+# --env-file или экспорт); по умолчанию выключен.
+services:
+  bridge:
+    restart: unless-stopped
+    environment:
+      OUTBOUND_ENABLED: ${OUTBOUND_ENABLED:-false}

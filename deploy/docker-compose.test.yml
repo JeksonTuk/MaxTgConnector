@@ -1,0 +1,30 @@
+services:
+  tests:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.test
+    environment:
+      PYTHONUNBUFFERED: "1"
+      DATA_DIR: /tmp/test-data
+      TMPDIR: /tmp/test-tmp
+      OUTBOUND_ENABLED: "false"
+      TG_BOT_TOKEN: test-not-a-real-token
+      TG_OWNER_ID: "100000001"
+      TG_FORUM_GROUP_ID: "-100000001"
+      TG_ALLOWED_USER_IDS: "100000001,100000002"
+      TG_BOT_USERNAME: FamilyMaxBot
+      MAX_PHONE: "+10000000000"
+    command: ["pytest", "-q"]
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    user: "10001:10001"
+    mem_limit: 768m
+    cpus: "1.0"
+    pids_limit: 128
+    restart: "no"

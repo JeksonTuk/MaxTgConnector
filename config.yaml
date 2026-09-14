@@ -1,0 +1,86 @@
+# MAX → Telegram Bridge — конфигурация
+
+telegram:
+  bot_token: "${TG_BOT_TOKEN}"
+  owner_id: "${TG_OWNER_ID}"
+  forum_group_id: "${TG_FORUM_GROUP_ID}"
+  # Только numeric Telegram user_id. Для production задаётся через env.
+  allowed_user_ids: "${TG_ALLOWED_USER_IDS}"
+  # Необязательно: если не задано, username bridge-бота берётся через Bot API.
+  bot_username: "${TG_BOT_USERNAME}"
+  # Основной служебный канал — личный чат владельца с ботом (owner_id).
+  # ops_topic_id опционален и нужен только для дополнительного дублирования
+  # ops-алертов и status-отчётов в forum topic внутри forum_group_id.
+  # Лучше задавать его в config.local.yaml на production.
+  # ops_topic_id: 1234
+
+max:
+  phone: "${MAX_PHONE}"
+  session_filename: "session.db"
+  # По умолчанию сохраняем старый direct-режим. На production основной
+  # РФ-канал задаётся в config.local.yaml через MAX_EGRESS_PROXY_URL.
+  egress:
+    active: "hetzner_direct"
+    fallback_policy: "manual"
+    profiles:
+      hetzner_direct:
+        type: "direct"
+
+storage:
+  db_filename: "bridge.db"
+  tmp_dirname: "tmp"
+
+health:
+  reminder_interval_hours: 4
+  heartbeat_interval_seconds: 30
+  worker_restart_backoff_seconds: 5
+  max_egress_probe_interval_seconds: 30
+  max_egress_startup_grace_seconds: 900
+  max_self_heal_grace_seconds: 180
+  max_self_heal_restart_cooldown_seconds: 1800
+  dm_history_sweep:
+    enabled: true
+    warmup_seconds: 600
+    warmup_interval_seconds: 120
+    steady_interval_seconds: 900
+    limit: 30
+    backfill_seconds: 172800
+    cycle_jitter_seconds: 30
+    per_chat_delay_seconds: 0.5
+
+# Read-only status API для внешнего watchdog (docs/runbooks/watchdog.md).
+# Требует BRIDGE_STATUS_TOKEN в .env.secrets — без токена API не поднимается.
+#
+# host — это адрес ВНУТРИ процесса. При запуске в Docker ставь "0.0.0.0":
+# публикация порта ведёт на внешний интерфейс контейнера, и сервер на
+# контейнерном loopback останется недоступен. Ограничение доступа при этом
+# никуда не девается — оно живёт на стороне publish: "127.0.0.1:18140:18140".
+status_api:
+  enabled: false
+  host: "127.0.0.1"
+  port: 18140
+
+bridge:
+  # Без явного chats MAX-сообщения не создают topic и не уходят в Telegram.
+  forward_all: false
+  # Аварийный выключатель Telegram → MAX; безопасное значение по умолчанию.
+  outbound_enabled: false
+  default_mode: "active"
+  file_retention_hours: 1
+  message_retention_days: 30
+  log_retention_days: 7
+  media_recovery_cache_ttl_hours: 48
+  max_file_size_mb: 50
+
+content:
+  forward_photos: true
+  forward_documents: true
+  forward_voice: true
+  forward_stickers: false
+  placeholder_unsupported: "[Неподдерживаемый тип: {type}]"
+  placeholder_file_too_large: "[Файл слишком большой: {filename}]"
+
+# Локальные привязки конкретных чатов лучше хранить в config.local.yaml
+# (файл не попадает в git). Пример структуры см. в config.local.yaml.example.
+# Новые MAX-чаты никогда не добавляются автоматически: сначала внеси их сюда.
+chats: []

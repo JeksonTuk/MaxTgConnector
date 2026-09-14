@@ -1,0 +1,326 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from contextlib import suppress
+from pathlib import Path
+from typing import Optional
+
+from .deps import SendDeps
+from .types import PendingOutboundAck
+from ...logging_utils import build_max_flow_id, log_event, sanitize_path
+from ...runtime.timeouts import (
+    DEFAULT_OPERATION_TIMEOUT_SECONDS,
+    MEDIA_TRANSFER_TIMEOUT_SECONDS,
+    with_timeout,
+)
+
+logger = logging.getLogger("src.adapters.max_adapter")
+
+
+class MaxSendService:
+    def __init__(self, deps: SendDeps):
+        self._deps = deps
+
+    @property
+    def _client(self):
+        return self._deps.connection.client
+
+    @property
+    def _started(self):
+        return self._deps.connection.started
+
+    @property
+    def _pending_outbound_acks(self):
+        return self._deps.outbound.pending_outbound_acks
+
+    async def _force_reconnect_after_transport_error(
+        self,
+        *,
+        chat_id: str,
+        flow_id: Optional[str],
+        error: str,
+    ):
+        client = self._client
+        self._deps.connection.started = False
+        if client is None:
+            return
+        log_event(
+            logger,
+            logging.WARNING,
+            "max.outbound.force_reconnect",
+            flow_id=flow_id,
+            direction="outbound",
+            stage="transport",
+            outcome="started",
+            reason="terminal_retryable_send_error",
+            max_chat_id=chat_id,
+            error=error,
+        )
+        try:
+            await client.close()
+        except Exception as exc:
+            log_event(
+                logger,
+                logging.WARNING,
+                "max.outbound.force_reconnect_failed",
+                flow_id=flow_id,
+                direction="outbound",
+                stage="transport",
+                outcome="failed",
+                reason="client_close_failed",
+                max_chat_id=chat_id,
+                error=str(exc).strip() or exc.__class__.__name__,
+            )
+
+    @staticmethod
+    def _is_definitely_unsent_transport_error(error: BaseException, safe_error: str) -> bool:
+        """Разрешить retry только для ошибок до фактической отправки в MAX."""
+        lowered = safe_error.lower()
+        if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+            return False
+        if any(marker in lowered for marker in ("connection reset", "broken pipe", "connection lost")):
+            return False
+        return any(
+            marker in lowered
+            for marker in (
+                "socket is not connected",
+                "must be online session",
+                "max client is not initialized",
+                "not connected to the server",
+            )
+        )
+
+    async def send_message(self, chat_id: str, text: str,
+                           reply_to_msg_id: Optional[str] = None,
+                           media_path: Optional[str] = None,
+                           media_type: Optional[str] = None,
+                           flow_id: Optional[str] = None) -> Optional[str]:
+        """Отправить сообщение в MAX чат (текст и/или медиа).
+
+        media_type: "photo" | "video" | "audio" | "document"
+
+        Возвращает:
+          str  — real max_msg_id
+          None — ошибка
+        """
+        # Ждём подключения до 15 секунд (на случай reconnect)
+        self._deps.runtime._set_last_outbound_failure(None, attempts=0)
+        if not self._started:
+            log_event(
+                logger,
+                logging.ERROR,
+                "max.outbound.failed",
+                flow_id=flow_id,
+                direction="outbound",
+                stage="transport",
+                outcome="failed",
+                reason="not_connected",
+                max_chat_id=chat_id,
+                media_type=media_type,
+            )
+            for _ in range(3):
+                await asyncio.sleep(5)
+                if self._started:
+                    break
+            else:
+                self._deps.runtime._set_last_outbound_failure(
+                    "MAX adapter is not connected",
+                    attempts=1,
+                )
+                return None
+
+        if not self._client:
+            self._deps.runtime._set_last_outbound_failure(
+                "MAX client is not initialized",
+                attempts=1,
+            )
+            return None
+
+        normalized_text = self._deps.runtime._normalize_outbound_text(text)
+        # Повторяем только доказуемо раннюю ошибку соединения. Таймаут ACK или
+        # сбой после возможного принятия MAX остаётся на durable reconciliation.
+        max_attempts = 3
+        retry_delays = (1, 2)
+
+        for attempt in range(1, max_attempts + 1):
+            loop = asyncio.get_running_loop()
+            pending = PendingOutboundAck(
+                chat_id=str(chat_id),
+                text=normalized_text,
+                reply_to_msg_id=reply_to_msg_id,
+                created_monotonic=time.monotonic(),
+                future=loop.create_future(),
+            )
+            self._pending_outbound_acks.append(pending)
+            log_event(
+                logger,
+                logging.INFO,
+                "max.outbound.send",
+                flow_id=flow_id,
+                direction="outbound",
+                stage="transport",
+                outcome="started",
+                max_chat_id=chat_id,
+                media_type=media_type,
+                has_text=bool(normalized_text),
+                reply_to_max_id=reply_to_msg_id,
+                filename=sanitize_path(media_path),
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+
+            try:
+                reply_to = int(reply_to_msg_id) if reply_to_msg_id else None
+                media_file_path = media_path if media_path and Path(media_path).exists() else None
+                result = await with_timeout(
+                    self._client.send_outbound_message(
+                        chat_id=int(chat_id),
+                        text=text,
+                        reply_to=reply_to,
+                        media_path=media_file_path,
+                        media_type=media_type,
+                    ),
+                    timeout_seconds=(
+                        MEDIA_TRANSFER_TIMEOUT_SECONDS
+                        if media_file_path
+                        else DEFAULT_OPERATION_TIMEOUT_SECONDS
+                    ),
+                    operation="max.send_outbound_message",
+                )
+                msg_id = result.message_id
+                if msg_id:
+                    self._deps.runtime._remember_expected_outbound_id(chat_id, msg_id)
+                    self._deps.runtime._set_last_outbound_failure(None, attempts=attempt)
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "max.outbound.sent",
+                        flow_id=flow_id,
+                        direction="outbound",
+                        stage="transport",
+                        outcome="sent",
+                        max_chat_id=chat_id,
+                        max_msg_id=msg_id,
+                        media_type=media_type,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                    return msg_id
+
+                if not normalized_text:
+                    error = "MAX send returned no message id"
+                    self._deps.runtime._set_last_outbound_failure(error, attempts=attempt)
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "max.outbound.failed",
+                        flow_id=flow_id,
+                        direction="outbound",
+                        stage="transport",
+                        outcome="failed",
+                        reason="max_send_failed",
+                        max_chat_id=chat_id,
+                        media_type=media_type,
+                        error=error,
+                        attempts=attempt,
+                    )
+                    return None
+
+                try:
+                    echoed_id = await asyncio.wait_for(asyncio.shield(pending.future), timeout=10)
+                    self._deps.runtime._set_last_outbound_failure(None, attempts=attempt)
+                    log_event(
+                        logger,
+                        logging.INFO,
+                        "max.outbound.sent",
+                        flow_id=flow_id,
+                        direction="outbound",
+                        stage="transport",
+                        outcome="sent",
+                        max_chat_id=chat_id,
+                        max_msg_id=str(echoed_id),
+                        media_type=media_type,
+                        reason="echo_ack",
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                    )
+                    return str(echoed_id)
+                except asyncio.TimeoutError:
+                    error = "MAX outbound ack timeout"
+                    self._deps.runtime._set_last_outbound_failure(error, attempts=attempt)
+                    log_event(
+                        logger,
+                        logging.ERROR,
+                        "max.outbound.failed",
+                        flow_id=flow_id,
+                        direction="outbound",
+                        stage="transport",
+                        outcome="failed",
+                        reason="ack_timeout",
+                        max_chat_id=chat_id,
+                        media_type=media_type,
+                        error=error,
+                        attempts=attempt,
+                    )
+                    return None
+            except Exception as e:
+                error = self._deps.runtime._safe_send_error(e)
+                retryable = self._deps.runtime._is_retryable_send_error(e)
+                definitely_unsent = self._is_definitely_unsent_transport_error(e, error)
+                if retryable and definitely_unsent and attempt < max_attempts:
+                    retry_in_seconds = retry_delays[attempt - 1]
+                    log_event(
+                        logger,
+                        logging.WARNING,
+                        "max.outbound.retry",
+                        flow_id=flow_id,
+                        direction="outbound",
+                        stage="transport",
+                        outcome="retry",
+                        reason="definite_unsent_transport_error",
+                        max_chat_id=chat_id,
+                        media_type=media_type,
+                        error=error,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        retry_in_seconds=retry_in_seconds,
+                    )
+                    await asyncio.sleep(retry_in_seconds)
+                    continue
+                self._deps.runtime._set_last_outbound_failure(error, attempts=attempt)
+                log_event(
+                    logger,
+                    logging.ERROR,
+                    "max.outbound.failed",
+                    flow_id=flow_id,
+                    direction="outbound",
+                    stage="transport",
+                    outcome="failed",
+                    reason="max_send_failed",
+                    max_chat_id=chat_id,
+                    media_type=media_type,
+                    error=error,
+                    attempts=attempt,
+                    retryable=retryable,
+                )
+                if retryable:
+                    await self._force_reconnect_after_transport_error(
+                        chat_id=chat_id,
+                        flow_id=flow_id,
+                        error=error,
+                    )
+                return None
+            finally:
+                if pending in self._pending_outbound_acks:
+                    self._pending_outbound_acks.remove(pending)
+                if pending.future.cancelled():
+                    pass
+                elif pending.future.done():
+                    with suppress(Exception):
+                        pending.future.exception()
+                else:
+                    pending.future.cancel()
+
+        return None
